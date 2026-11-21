@@ -1,6 +1,7 @@
 use listener_library::*;
 use listener_memory::{
-    ExecutingMemory, InspectingMemory, MemoryDefinition, OpeningMemory, operations::*, state::Audio,
+    CreatingMemory, Error, ExecutingMemory, InspectingMemory, MemoryDefinition, OpeningMemory,
+    operations::*, state::Audio,
 };
 use meta_signal_listener::Set;
 use tempfile::TempDir;
@@ -61,10 +62,13 @@ fn backend(name: &str, model: &str) -> Backend {
         timeout: Timeout(Seconds(30)),
     }
 }
+// The Memory record's kernel table and key, used by fixtures that build a store by hand.
+const TABLE: &str = "listener-state";
+const KEY: &str = "state";
 fn definition(directory: &TempDir) -> MemoryDefinition {
     MemoryDefinition {
         path: directory.path().join("new-memory.redb"),
-        table_name: "listener-state",
+        table_name: TABLE,
         record_key: "state".into(),
     }
 }
@@ -159,8 +163,14 @@ fn ready_id(next: Next) -> String {
     };
     ready.job_id.0
 }
-fn open(directory: &TempDir, sequence: Sequence) -> listener_memory::Memory {
-    definition(directory).open(configuration(sequence)).unwrap()
+fn create(directory: &TempDir, sequence: Sequence) -> listener_memory::Memory {
+    definition(directory)
+        .create(configuration(sequence))
+        .unwrap()
+}
+// Reopening takes no configuration: the persisted one is authoritative.
+fn reopen(directory: &TempDir) -> listener_memory::Memory {
+    definition(directory).open().unwrap()
 }
 fn turn() -> Input {
     Input::Turn(Options {
@@ -302,9 +312,7 @@ fn fresh_memory_and_remember_never_touch_old_stores_and_survive_reopen() {
     let audio = directory.path().join("old-audio.log");
     std::fs::write(&legacy, b"old-text\n").unwrap();
     std::fs::write(&audio, b"old-audio\0").unwrap();
-    let memory = definition(&directory)
-        .open(configuration(Sequence::AsRecorded))
-        .unwrap();
+    let memory = create(&directory, Sequence::AsRecorded);
     let committed = execute(
         &memory,
         Input::Import(Import_Data {
@@ -324,9 +332,7 @@ fn fresh_memory_and_remember_never_touch_old_stores_and_survive_reopen() {
     assert_eq!(job.imported_text.0, Some(Text("remembered".into())));
     assert_eq!(job.moment, Moment(7));
     drop(memory);
-    let reopened = definition(&directory)
-        .open(configuration(Sequence::AsReady))
-        .unwrap();
+    let reopened = reopen(&directory);
     assert_eq!(reopened.inspect().unwrap(), state);
     assert!(matches!(
         execute(&reopened, Input::Requeue(JobId("old".into())), 200, None).output,
@@ -341,9 +347,7 @@ fn fresh_memory_and_remember_never_touch_old_stores_and_survive_reopen() {
 fn both_sequence_policies_handle_out_of_order_completions_with_one_delivery_claim() {
     for sequence in [Sequence::AsRecorded, Sequence::AsReady] {
         let directory = TempDir::new().unwrap();
-        let memory = definition(&directory)
-            .open(configuration(sequence.clone()))
-            .unwrap();
+        let memory = create(&directory, sequence.clone());
         start(&memory, "first", 10);
         stop(&memory, "first");
         start(&memory, "second", 11);
@@ -389,9 +393,7 @@ fn both_sequence_policies_handle_out_of_order_completions_with_one_delivery_clai
 #[test]
 fn exhausted_job_leaves_the_delivery_order() {
     let directory = TempDir::new().unwrap();
-    let memory = definition(&directory)
-        .open(configuration(Sequence::AsRecorded))
-        .unwrap();
+    let memory = create(&directory, Sequence::AsRecorded);
     start(&memory, "first", 1);
     stop(&memory, "first");
     start(&memory, "second", 2);
@@ -416,9 +418,7 @@ fn exhausted_job_leaves_the_delivery_order() {
 #[test]
 fn configuration_updates_are_atomic_and_jobs_snapshot_locations_and_recording_settings() {
     let directory = TempDir::new().unwrap();
-    let memory = definition(&directory)
-        .open(configuration(Sequence::AsRecorded))
-        .unwrap();
+    let memory = create(&directory, Sequence::AsRecorded);
     let first = start(&memory, "first", 1);
     stop(&memory, "first");
     let before = memory.inspect().unwrap();
@@ -466,29 +466,24 @@ fn configuration_updates_are_atomic_and_jobs_snapshot_locations_and_recording_se
     ));
     assert!(refused.changes.set_option.is_none());
     assert_eq!(memory.inspect().unwrap(), state);
-    assert!(
-        memory
-            .execute(request(
-                Input::Apply(Set::HistoryLength(HistoryLength(-1))),
-                3,
-                None
-            ))
-            .is_err()
+    assert_eq!(
+        observe(
+            &memory,
+            Input::Apply(Set::HistoryLength(HistoryLength(-1))),
+            3
+        ),
+        Output::Applying(Applying::InvalidValue)
     );
     assert_eq!(memory.inspect().unwrap(), state);
     drop(memory);
-    let reopened = definition(&directory)
-        .open(configuration(Sequence::AsReady))
-        .unwrap();
+    let reopened = reopen(&directory);
     assert_eq!(reopened.inspect().unwrap(), state);
 }
 
 #[test]
 fn text_and_audio_expire_independently_and_only_matching_successful_deletions_are_forgotten() {
     let directory = TempDir::new().unwrap();
-    let memory = definition(&directory)
-        .open(configuration(Sequence::AsRecorded))
-        .unwrap();
+    let memory = create(&directory, Sequence::AsRecorded);
     let first = start(&memory, "first", 0);
     stop(&memory, "first");
     assert_eq!(ready_id(heard(&memory, "first", "one")), "first");
@@ -570,9 +565,7 @@ fn text_and_audio_expire_independently_and_only_matching_successful_deletions_ar
 #[test]
 fn audio_expiry_preserves_text_and_recall_until_text_expiry() {
     let directory = TempDir::new().unwrap();
-    let memory = definition(&directory)
-        .open(configuration(Sequence::AsRecorded))
-        .unwrap();
+    let memory = create(&directory, Sequence::AsRecorded);
     let fresh = start(&memory, "job", 0);
     stop(&memory, "job");
     heard(&memory, "job", "text");
@@ -606,9 +599,7 @@ fn audio_expiry_preserves_text_and_recall_until_text_expiry() {
 #[test]
 fn one_recording_stale_interrupt_and_refused_operations_leave_consistent_state() {
     let directory = TempDir::new().unwrap();
-    let memory = definition(&directory)
-        .open(configuration(Sequence::AsRecorded))
-        .unwrap();
+    let memory = create(&directory, Sequence::AsRecorded);
     start(&memory, "first", 0);
     assert_eq!(
         execute(&memory, Input::Interrupt(JobId("stale".into())), 1, None).output,
@@ -662,9 +653,7 @@ fn one_recording_stale_interrupt_and_refused_operations_leave_consistent_state()
 #[test]
 fn restart_returns_only_the_accepted_work_plan_and_normalizes_recording() {
     let directory = TempDir::new().unwrap();
-    let memory = definition(&directory)
-        .open(configuration(Sequence::AsReady))
-        .unwrap();
+    let memory = create(&directory, Sequence::AsReady);
     start(&memory, "transcribing", 0);
     stop(&memory, "transcribing");
     start(&memory, "waiting", 1);
@@ -672,9 +661,7 @@ fn restart_returns_only_the_accepted_work_plan_and_normalizes_recording() {
     heard(&memory, "waiting", "ready");
     start(&memory, "recording", 2);
     drop(memory);
-    let reopened = definition(&directory)
-        .open(configuration(Sequence::AsRecorded))
-        .unwrap();
+    let reopened = reopen(&directory);
     let result = execute(&reopened, Input::Recover, 3, None);
     let Output::Recovered(recovery) = result.output else {
         panic!()
@@ -746,11 +733,7 @@ fn kernel_rollback_and_schema_mismatch_are_real_persistence_boundaries() {
 #[test]
 fn actual_concurrent_calls_are_serialized_and_keep_every_import() {
     let directory = TempDir::new().unwrap();
-    let memory = std::sync::Arc::new(
-        definition(&directory)
-            .open(configuration(Sequence::AsRecorded))
-            .unwrap(),
-    );
+    let memory = std::sync::Arc::new(create(&directory, Sequence::AsRecorded));
     let handles: Vec<_> = (0..8)
         .map(|index| {
             let memory = memory.clone();
@@ -807,43 +790,24 @@ fn archive_round_trip_keeps_the_recording_snapshot_and_both_unobserved_cases() {
 #[test]
 fn invalid_recording_settings_are_atomic_and_the_final_state_is_durable() {
     let directory = TempDir::new().unwrap();
-    let memory = definition(&directory)
-        .open(configuration(Sequence::AsRecorded))
-        .unwrap();
+    let memory = create(&directory, Sequence::AsRecorded);
     let before = memory.inspect().unwrap();
     let mut invalid = before.configuration.recording_settings.clone();
     invalid.sample_rate = SampleRate(12345);
-    assert!(
-        memory
-            .execute(request(
-                Input::Apply(Set::RecordingSettings(invalid)),
-                0,
-                None
-            ))
-            .is_err()
+    assert_eq!(
+        observe(&memory, Input::Apply(Set::RecordingSettings(invalid)), 0),
+        Output::Applying(Applying::InvalidValue)
     );
     assert_eq!(memory.inspect().unwrap(), before);
     let mut invalid = before.configuration.recording_settings.clone();
     invalid.capture_fragment_bytes = CaptureFragmentBytes(3);
-    assert!(
-        memory
-            .execute(request(
-                Input::Apply(Set::RecordingSettings(invalid)),
-                0,
-                None
-            ))
-            .is_err()
+    assert_eq!(
+        observe(&memory, Input::Apply(Set::RecordingSettings(invalid)), 0),
+        Output::Applying(Applying::InvalidValue)
     );
     assert_eq!(memory.inspect().unwrap(), before);
     drop(memory);
-    assert_eq!(
-        definition(&directory)
-            .open(configuration(Sequence::AsReady))
-            .unwrap()
-            .inspect()
-            .unwrap(),
-        before
-    );
+    assert_eq!(reopen(&directory).inspect().unwrap(), before);
 }
 
 #[test]
@@ -973,9 +937,7 @@ fn every_generated_ordinary_input_uses_its_paired_answering_capability() {
     );
 
     let directory = TempDir::new().unwrap();
-    let memory = definition(&directory)
-        .open(configuration(Sequence::AsRecorded))
-        .unwrap();
+    let memory = create(&directory, Sequence::AsRecorded);
     let committed = execute(
         &memory,
         listener_memory::operations::Input::Import(Import_Data {
@@ -1025,7 +987,9 @@ fn meta_configuration_is_a_unit_query_and_its_paired_dispatch_is_generated() {
             &self,
         ) -> Result<signal::Stream<Configuration, Set>, meta_signal_listener::Output> {
             Err(meta_signal_listener::Output::Refused(
-                meta_signal_listener::UnknownBackend(BackendName("missing".into())),
+                meta_signal_listener::Refused_Data::UnknownBackend(UnknownBackend(BackendName(
+                    "missing".into(),
+                ))),
             ))
         }
     }
@@ -1061,14 +1025,14 @@ fn datom_queries_and_refusals_keep_the_approved_shapes() {
         .actualize(&mut budget())
         .unwrap();
     assert_eq!(query, meta_signal_listener::Input::Configuration);
-    let refusal: meta_signal_listener::Output = Potential::from("Refused.missing")
+    let refusal: meta_signal_listener::Output = Potential::from("Refused.UnknownBackend.missing")
         .actualize(&mut budget())
         .unwrap();
     assert_eq!(
         refusal,
-        meta_signal_listener::Output::Refused(meta_signal_listener::UnknownBackend(BackendName(
-            "missing".into()
-        )))
+        meta_signal_listener::Output::Refused(meta_signal_listener::Refused_Data::UnknownBackend(
+            UnknownBackend(BackendName("missing".into()))
+        ))
     );
     let ordinary: signal_listener::Output = Potential::from("Toggled.Began.job")
         .actualize(&mut budget())
@@ -1085,7 +1049,7 @@ fn datom_queries_and_refusals_keep_the_approved_shapes() {
 #[test]
 fn last_answers_the_newest_retained_text_and_nothing_kept_once_none_remains() {
     let directory = TempDir::new().unwrap();
-    let memory = open(&directory, Sequence::AsRecorded);
+    let memory = create(&directory, Sequence::AsRecorded);
     assert_eq!(
         observe(&memory, Input::Last, 0),
         Output::Lasting(Lasting::NothingKept)
@@ -1133,7 +1097,7 @@ fn last_answers_the_newest_retained_text_and_nothing_kept_once_none_remains() {
 #[test]
 fn recollect_lists_retained_imported_and_captured_text_newest_first_within_history_length() {
     let directory = TempDir::new().unwrap();
-    let memory = open(&directory, Sequence::AsRecorded);
+    let memory = create(&directory, Sequence::AsRecorded);
     assert_eq!(
         observe(&memory, Input::Recollect, 0),
         Output::Recollected(Vec::new())
@@ -1197,12 +1161,12 @@ fn recollect_lists_retained_imported_and_captured_text_newest_first_within_histo
 
 // RC13 coverage: Backend settings. Catches Set.Backend appending a second definition under an
 // existing name or moving a replaced one to the end, an inserted backend joining Order on its
-// own, RemoveBackend of an absent name reported as applied or committing a change, and
-// backend definitions or Order lost on reopen.
+// own, RemoveBackend of an absent name refused (the ruling admits every RemoveBackend) or
+// altering state, and backend definitions or Order lost on reopen.
 #[test]
 fn backend_settings_insert_replace_and_remove_by_name_and_survive_reopen() {
     let directory = TempDir::new().unwrap();
-    let memory = open(&directory, Sequence::AsRecorded);
+    let memory = create(&directory, Sequence::AsRecorded);
     let speech = BackendName("speech".into());
     let whisper = BackendName("whisper".into());
     apply(&memory, Set::Backend(backend("whisper", "whisper-one")));
@@ -1224,20 +1188,13 @@ fn backend_settings_insert_replace_and_remove_by_name_and_survive_reopen() {
     apply(&memory, Set::Backend(backend("spare", "spare-one")));
     apply(&memory, Set::RemoveBackend(BackendName("spare".into())));
     assert_eq!(settings(&memory).backend_vector, expected);
-    assert_eq!(
-        observe(
-            &memory,
-            Input::Apply(Set::RemoveBackend(BackendName("spare".into()))),
-            0
-        ),
-        Output::Applying(Applying::UnknownBackend(
-            meta_signal_listener::UnknownBackend(BackendName("spare".into()))
-        ))
-    );
+    let before = memory.inspect().unwrap();
+    apply(&memory, Set::RemoveBackend(BackendName("spare".into())));
+    assert_eq!(memory.inspect().unwrap(), before);
     apply(&memory, Set::Order(vec![whisper.clone(), speech.clone()]));
     let state = memory.inspect().unwrap();
     drop(memory);
-    let reopened = open(&directory, Sequence::AsReady);
+    let reopened = reopen(&directory);
     assert_eq!(reopened.inspect().unwrap(), state);
     let configuration = settings(&reopened);
     assert_eq!(configuration.backend_vector, expected);
@@ -1251,7 +1208,7 @@ fn backend_settings_insert_replace_and_remove_by_name_and_survive_reopen() {
 #[test]
 fn terms_keep_spelling_and_order_and_add_and_remove_are_idempotent_across_reopen() {
     let directory = TempDir::new().unwrap();
-    let memory = open(&directory, Sequence::AsRecorded);
+    let memory = create(&directory, Sequence::AsRecorded);
     start(&memory, "job", 1);
     for text in ["Ethos Zero", "datom", "Datom"] {
         apply(&memory, Set::AddTerm(term(text)));
@@ -1276,7 +1233,7 @@ fn terms_keep_spelling_and_order_and_add_and_remove_are_idempotent_across_reopen
         })
     );
     drop(memory);
-    let reopened = open(&directory, Sequence::AsReady);
+    let reopened = reopen(&directory);
     assert_eq!(reopened.inspect().unwrap(), before);
     assert_eq!(settings(&reopened).term_vector, kept);
 }
@@ -1289,7 +1246,7 @@ fn terms_keep_spelling_and_order_and_add_and_remove_are_idempotent_across_reopen
 #[test]
 fn turn_overrides_are_snapshotted_against_later_configuration_and_survive_reopen() {
     let directory = TempDir::new().unwrap();
-    let memory = open(&directory, Sequence::AsRecorded);
+    let memory = create(&directory, Sequence::AsRecorded);
     let speech = BackendName("speech".into());
     let whisper = BackendName("whisper".into());
     apply(&memory, Set::Backend(backend("whisper", "whisper-one")));
@@ -1339,27 +1296,26 @@ fn turn_overrides_are_snapshotted_against_later_configuration_and_survive_reopen
     );
     assert_eq!(finish(&memory, "plain"), Next::Nothing);
     let before = memory.inspect().unwrap();
-    // The refusal's shape awaits a ruling (RC4); only its effect is held here.
-    if let Ok(committed) = memory.execute(request(
-        Input::Turn(Options {
-            delivery_option: None,
-            backend_name_vector_option: Some(vec![BackendName("missing".into())]),
-        }),
-        3,
-        Some("unknown"),
-    )) {
-        assert!(!matches!(
-            committed.output,
-            Output::Turning(Turning::Fresh(_))
-        ));
-        assert_eq!(committed.changes, changes(&[], &[]));
-    }
+    assert_eq!(
+        execute(
+            &memory,
+            Input::Turn(Options {
+                delivery_option: None,
+                backend_name_vector_option: Some(vec![BackendName("missing".into())]),
+            }),
+            3,
+            Some("unknown"),
+        ),
+        Committed {
+            output: Output::Turning(Turning::UnknownBackend(UnknownBackend(BackendName(
+                "missing".into()
+            )))),
+            changes: changes(&[], &[]),
+        }
+    );
     assert_eq!(memory.inspect().unwrap(), before);
     drop(memory);
-    assert_eq!(
-        open(&directory, Sequence::AsReady).inspect().unwrap(),
-        before
-    );
+    assert_eq!(reopen(&directory).inspect().unwrap(), before);
 }
 
 // RC13 coverage: AudioLocation archive identity. Catches a location rebuilt from the current
@@ -1368,7 +1324,7 @@ fn turn_overrides_are_snapshotted_against_later_configuration_and_survive_reopen
 #[test]
 fn audio_location_archives_with_its_original_directory_across_reopen() {
     let directory = TempDir::new().unwrap();
-    let memory = open(&directory, Sequence::AsRecorded);
+    let memory = create(&directory, Sequence::AsRecorded);
     let fresh = capture(&memory, "first", 0, "one");
     let original = location("/fixture/audio-before", "first");
     assert_eq!(fresh.audio_location, original);
@@ -1388,7 +1344,7 @@ fn audio_location_archives_with_its_original_directory_across_reopen() {
         location("/fixture/audio-after", "second")
     );
     drop(memory);
-    let memory = open(&directory, Sequence::AsRecorded);
+    let memory = reopen(&directory);
     apply(&memory, Set::AudioKept(Retention::Days(Days(0))));
     let pruned = observe(&memory, Input::Prune, 10);
     assert_eq!(pruned, Output::Pruned(vec![original.clone()]));
@@ -1429,7 +1385,7 @@ fn audio_location_archives_with_its_original_directory_across_reopen() {
 fn exhaustion_frees_the_delivery_order_under_both_sequence_policies() {
     for sequence in [Sequence::AsRecorded, Sequence::AsReady] {
         let directory = TempDir::new().unwrap();
-        let memory = open(&directory, sequence.clone());
+        let memory = create(&directory, sequence.clone());
         for (id, moment) in [("first", 1), ("second", 2), ("third", 3)] {
             start(&memory, id, moment);
             stop(&memory, id);
@@ -1487,7 +1443,7 @@ fn exhaustion_frees_the_delivery_order_under_both_sequence_policies() {
 #[test]
 fn every_commit_reports_exactly_its_state_changes_and_queries_change_nothing() {
     let directory = TempDir::new().unwrap();
-    let memory = open(&directory, Sequence::AsRecorded);
+    let memory = create(&directory, Sequence::AsRecorded);
     for input in [
         Input::Last,
         Input::Pending,
@@ -1600,10 +1556,7 @@ fn every_commit_reports_exactly_its_state_changes_and_queries_change_nothing() {
         Output::Pruned(Vec::new())
     );
     drop(memory);
-    assert_eq!(
-        open(&directory, Sequence::AsReady).inspect().unwrap(),
-        state
-    );
+    assert_eq!(reopen(&directory).inspect().unwrap(), state);
 }
 
 // RC13 coverage: Jobs stream projection, restricted to active jobs until the membership ruling
@@ -1651,7 +1604,7 @@ fn committed_changes_fold_to_the_pending_query_for_active_jobs() {
         }
     }
     let directory = TempDir::new().unwrap();
-    let memory = open(&directory, Sequence::AsRecorded);
+    let memory = create(&directory, Sequence::AsRecorded);
     let Output::Standing(opened) = observe(&memory, Input::Pending, 0) else {
         panic!("pending jobs expected")
     };
@@ -1705,7 +1658,7 @@ fn committed_changes_fold_to_the_pending_query_for_active_jobs() {
     view.follow(&memory, Input::Requeue(JobId("delivered".into())), 11, None);
     view.follow(&memory, turn(), 12, Some("restarted"));
     drop(memory);
-    let memory = open(&directory, Sequence::AsRecorded);
+    let memory = reopen(&directory);
     view.follow(&memory, Input::Recover, 13, None);
     assert_eq!(view.jobs.get("restarted"), Some(&State::Transcribing));
 }
@@ -1717,7 +1670,7 @@ fn committed_changes_fold_to_the_pending_query_for_active_jobs() {
 #[test]
 fn datom_spells_an_audio_location_once_with_its_original_directory() {
     let directory = TempDir::new().unwrap();
-    let memory = open(&directory, Sequence::AsRecorded);
+    let memory = create(&directory, Sequence::AsRecorded);
     let fresh = capture(&memory, "first", 0, "one");
     let spelled: AudioLocation = decode("{ «/fixture/audio-before» first }").unwrap();
     assert_eq!(spelled, fresh.audio_location);
@@ -1762,14 +1715,12 @@ fn datom_spells_term_and_backend_settings_by_their_contract_names() {
         ),
     ];
     let directory = TempDir::new().unwrap();
-    let memory = open(&directory, Sequence::AsRecorded);
+    let memory = create(&directory, Sequence::AsRecorded);
     for (text, set) in cases {
         let decoded: meta_signal_listener::Input = decode(text).unwrap();
         assert_eq!(decoded, meta_signal_listener::Input::Configure(set.clone()));
-        // The removal names a backend never configured; its spelling alone is held here.
-        if !matches!(set, Set::RemoveBackend(_)) {
-            apply(&memory, set);
-        }
+        // The removal names a backend never configured; every RemoveBackend is admitted.
+        apply(&memory, set);
     }
     let configuration = settings(&memory);
     assert_eq!(configuration.term_vector, vec![term("Ethos Zero")]);
@@ -1787,4 +1738,1276 @@ fn datom_spells_term_and_backend_settings_by_their_contract_names() {
     ] {
         assert!(decode::<meta_signal_listener::Input>(misspelled).is_err());
     }
+}
+
+// Fixtures for the repair scenarios (kvld). They build stores and inputs; none is a producer
+// entry point.
+fn name(text: &str) -> BackendName {
+    BackendName(text.into())
+}
+fn definition_at(path: &std::path::Path) -> MemoryDefinition {
+    MemoryDefinition {
+        path: path.to_path_buf(),
+        table_name: TABLE,
+        record_key: KEY.into(),
+    }
+}
+fn configured(sequence: Sequence, backends: &[&str], order: &[&str]) -> Configuration {
+    Configuration {
+        backend_vector: backends.iter().map(|text| backend(text, "model")).collect(),
+        order: Order(order.iter().map(|text| name(text)).collect()),
+        ..configuration(sequence)
+    }
+}
+// A configuration with one path or recording Set applied, written independently of the
+// producer's Set handling.
+fn configured_with(mut configuration: Configuration, set: &Set) -> Configuration {
+    match set.clone() {
+        Set::PasteProgram(program) => configuration.paste_program = PasteProgram(program),
+        Set::CopyProgram(program) => configuration.copy_program = CopyProgram(program),
+        Set::SecretProgram(program) => configuration.secret_program = SecretProgram(program),
+        Set::AudioDirectory(directory) => configuration.audio_directory = AudioDirectory(directory),
+        Set::RecordingSettings(settings) => configuration.recording_settings = settings,
+        other => panic!("no fixture for {other:?}"),
+    }
+    configuration
+}
+fn overriding(names: &[&str]) -> Input {
+    Input::Turn(Options {
+        delivery_option: None,
+        backend_name_vector_option: Some(names.iter().map(|text| name(text)).collect()),
+    })
+}
+fn trial(backends: Vec<Backend>) -> Output {
+    Output::Trial(Trial_Data {
+        backend_vector: backends,
+        term_vector: Vec::new(),
+    })
+}
+fn schema(version: u32) -> memory::Schema {
+    memory::Schema {
+        version: memory::SchemaVersion::new(version),
+    }
+}
+// Writes a Memory record into a kernel store by hand, as a fixture for states the public
+// operations cannot reach.
+fn write_record(path: &std::path::Path, record: &listener_memory::state::Record) {
+    let kernel = memory::Memory::open_with_schema(path, &schema(1)).unwrap();
+    let table: memory::Table<&str, listener_memory::state::Record> = memory::Table::new(TABLE);
+    kernel
+        .write(|transaction| table.insert(transaction, KEY, record))
+        .unwrap();
+}
+fn kernel_record(path: &std::path::Path) -> Option<listener_memory::state::Record> {
+    let kernel = memory::Memory::open_with_schema(path, &schema(1)).unwrap();
+    let table: memory::Table<&str, listener_memory::state::Record> = memory::Table::new(TABLE);
+    kernel
+        .read(|transaction| table.get(transaction, KEY))
+        .unwrap()
+}
+fn standing(memory: &listener_memory::Memory) -> std::collections::BTreeMap<String, State> {
+    let Output::Standing(jobs) = observe(memory, Input::Pending, 0) else {
+        panic!("pending jobs expected")
+    };
+    let map: std::collections::BTreeMap<_, _> = jobs
+        .iter()
+        .map(|job| (job.job_id.0.clone(), job.state.clone()))
+        .collect();
+    assert_eq!(map.len(), jobs.len(), "a job listed twice: {jobs:?}");
+    map
+}
+
+// The creation crash fixture. A child process runs one creator under a file-size limit, so
+// the kernel kills it with SIGXFSZ, or refuses its write, wherever the store's file outgrows
+// the limit; the limit doubles from 512 bytes until a creation completes. The kernel
+// preallocates about a mebibyte when it first opens a file, so the fixture's configuration
+// carries about three mebibytes of terms: the record's commit must then grow the file again,
+// and one limit ends the child after the schema stamp and before the record commits. The
+// "producer" creator is CreatingMemory::create; the "direct" creator is a deliberately wrong
+// one that stamps the kernel schema at the final path and commits the record after it, as the
+// pre-repair open did. A crash after the record commits and before publication grows no file
+// and is out of this fixture's reach.
+const CREATION_PATH: &str = "LISTENER_TESTS_CREATION_PATH";
+const CREATOR: &str = "LISTENER_TESTS_CREATOR";
+const SIGXFSZ: i32 = 25;
+const REFUSED_WRITE: i32 = 70;
+fn crash_configuration() -> Configuration {
+    Configuration {
+        term_vector: (0..48)
+            .map(|index| Term(format!("{index:02}{}", "t".repeat(65_536))))
+            .collect(),
+        ..configuration(Sequence::AsReady)
+    }
+}
+// What a kernel file holds, read without the Listener's open.
+#[derive(Debug, PartialEq)]
+enum Stage {
+    Unstamped,
+    StampedOnly,
+    Recorded,
+    Damaged,
+}
+fn stage(path: &std::path::Path) -> Stage {
+    if std::fs::metadata(path).unwrap().len() == 0 {
+        return Stage::Unstamped;
+    }
+    let Ok(kernel) = memory::Memory::open_with_schema(path, &schema(1)) else {
+        return Stage::Damaged;
+    };
+    let table: memory::Table<&str, listener_memory::state::Record> = memory::Table::new(TABLE);
+    match kernel.read(|transaction| table.get(transaction, KEY)) {
+        Ok(Some(_)) => Stage::Recorded,
+        Ok(None) => Stage::StampedOnly,
+        Err(_) => Stage::Damaged,
+    }
+}
+#[derive(Debug, PartialEq)]
+enum FinalPath {
+    Absent,
+    Complete,
+    Incomplete(Stage),
+}
+fn final_path(path: &std::path::Path) -> FinalPath {
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => FinalPath::Absent,
+        Err(error) => panic!("final path unreadable: {error}"),
+        Ok(_) => match stage(path) {
+            Stage::Recorded => match definition_at(path).open() {
+                Ok(memory) if settings(&memory) == crash_configuration() => FinalPath::Complete,
+                _ => FinalPath::Incomplete(Stage::Recorded),
+            },
+            other => FinalPath::Incomplete(other),
+        },
+    }
+}
+#[derive(Debug, PartialEq)]
+enum Ending {
+    Completed,
+    Killed,
+    RefusedWrite,
+}
+#[derive(Debug)]
+struct CreationRun {
+    blocks: u64,
+    ending: Ending,
+    final_path: FinalPath,
+    staged: Vec<Stage>,
+    parent: TempDir,
+}
+fn creation_runs(creator: &str) -> Vec<CreationRun> {
+    use std::os::unix::process::ExitStatusExt;
+    let executable = std::env::current_exe().unwrap();
+    let mut runs = Vec::new();
+    for exponent in 0..=20 {
+        let blocks = 1_u64 << exponent;
+        let parent = TempDir::new().unwrap();
+        let path = parent.path().join("state.memory");
+        let status = std::process::Command::new("/bin/sh")
+            .args([
+                "-c",
+                "ulimit -c 0; ulimit -f \"$1\" && exec \"$2\" --ignored --exact creation_child --test-threads 1",
+                "sh",
+            ])
+            .arg(blocks.to_string())
+            .arg(&executable)
+            .env(CREATION_PATH, &path)
+            .env(CREATOR, creator)
+            .current_dir(parent.path())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        // Any other ending (a panic among them) is the fixture failing, not a crash window.
+        let ending = match (status.code(), status.signal()) {
+            (Some(0), _) => Ending::Completed,
+            (Some(REFUSED_WRITE), _) => Ending::RefusedWrite,
+            (None, Some(SIGXFSZ)) => Ending::Killed,
+            _ => panic!("creation child ended otherwise at {blocks} blocks: {status}"),
+        };
+        let staged = std::fs::read_dir(parent.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path().join("state.memory"))
+            .filter(|staged| staged.is_file())
+            .map(|staged| stage(&staged))
+            .collect();
+        let completed = ending == Ending::Completed;
+        runs.push(CreationRun {
+            blocks,
+            ending,
+            final_path: final_path(&path),
+            staged,
+            parent,
+        });
+        if completed {
+            return runs;
+        }
+    }
+    panic!("no creation completed under any file-size limit: {runs:?}")
+}
+#[test]
+#[ignore = "child process of the creation crash fixture; its parent names the creator"]
+fn creation_child() {
+    let path = std::path::PathBuf::from(std::env::var_os(CREATION_PATH).unwrap());
+    let created = match std::env::var(CREATOR).unwrap().as_str() {
+        "producer" => definition_at(&path).create(crash_configuration()).is_ok(),
+        "direct" => {
+            let kernel = memory::Memory::open_with_schema(&path, &schema(1)).unwrap();
+            let table: memory::Table<&str, listener_memory::state::Record> =
+                memory::Table::new(TABLE);
+            let record = listener_memory::state::Record {
+                job_vector: Vec::new(),
+                configuration: crash_configuration(),
+                delivery_claim: listener_memory::state::DeliveryClaim(None),
+            };
+            kernel
+                .write(|transaction| table.insert(transaction, KEY, &record))
+                .is_ok()
+        }
+        creator => panic!("unknown creator {creator}"),
+    };
+    std::process::exit(if created { 0 } else { REFUSED_WRITE });
+}
+
+// RC1: an abrupt end during first creation leaves no final file, whether it comes before the
+// schema stamp or after it and before the record commits; a retry then creates a complete
+// store. Catches a creation that stamps the kernel schema or commits the record at the final
+// path (a crash leaves a stamped-only or empty file there, which every later open refuses),
+// one that publishes before the record is durable, and one whose interrupted staging blocks
+// a later creation.
+#[test]
+fn an_interrupted_creation_leaves_no_final_file_and_a_retry_creates_a_complete_store() {
+    let runs = creation_runs("producer");
+    for window in [Stage::Unstamped, Stage::StampedOnly] {
+        assert!(
+            runs.iter().any(|run| run.ending != Ending::Completed
+                && matches!(run.staged.as_slice(), [only] if *only == window)),
+            "the fixture did not interrupt staging at this window: {runs:?}"
+        );
+    }
+    for run in &runs {
+        let path = run.parent.path().join("state.memory");
+        if run.ending == Ending::Completed {
+            assert_eq!(run.final_path, FinalPath::Complete, "{run:?}");
+            continue;
+        }
+        assert_eq!(run.final_path, FinalPath::Absent, "{run:?}");
+        assert!(
+            matches!(definition_at(&path).open(), Err(Error::MissingStore)),
+            "after the run at {} blocks",
+            run.blocks
+        );
+        assert_eq!(final_path(&path), FinalPath::Absent);
+        let retried = definition_at(&path)
+            .create(configuration(Sequence::AsRecorded))
+            .unwrap();
+        start(&retried, "after", 1);
+        let state = retried.inspect().unwrap();
+        drop(retried);
+        let reopened = definition_at(&path).open().unwrap();
+        assert_eq!(reopened.inspect().unwrap(), state);
+        assert_eq!(settings(&reopened), configuration(Sequence::AsRecorded));
+    }
+}
+
+// The crash fixture's own discrimination: the same limits applied to the deliberately wrong
+// direct creator leave an empty and a stamped-only final file (the pre-repair failure shape),
+// so the fixture reaches the windows that matter and the test above cannot pass vacuously.
+#[test]
+fn the_creation_crash_fixture_catches_a_creator_that_writes_the_final_path() {
+    let runs = creation_runs("direct");
+    for window in [Stage::Unstamped, Stage::StampedOnly] {
+        let shape = FinalPath::Incomplete(window);
+        assert!(
+            runs.iter()
+                .any(|run| run.ending != Ending::Completed && run.final_path == shape),
+            "{runs:?}"
+        );
+    }
+}
+
+// RC1: a stamped-only final file (the pre-repair failure shape) is refused and never
+// populated. Catches an open that initializes a missing record under the persisted path
+// (resuming creation with a supplied or default configuration), a create that treats the
+// existing file as its own, a schema-mismatched or foreign file that is reinitialized, and a
+// directory at the path treated as a store.
+#[test]
+fn a_stamped_only_mismatched_or_foreign_final_path_is_refused_and_left_as_it_was() {
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join("stamped.memory");
+    drop(memory::Memory::open_with_schema(&path, &schema(1)).unwrap());
+    for _ in 0..2 {
+        assert!(matches!(
+            definition_at(&path).open(),
+            Err(Error::MissingRecord)
+        ));
+        assert!(matches!(
+            definition_at(&path).create(configuration(Sequence::AsReady)),
+            Err(Error::StoreAlreadyExists)
+        ));
+        assert_eq!(kernel_record(&path), None);
+    }
+
+    let mismatched = directory.path().join("mismatched.memory");
+    drop(memory::Memory::open_with_schema(&mismatched, &schema(2)).unwrap());
+    assert!(definition_at(&mismatched).open().is_err());
+    assert!(matches!(
+        definition_at(&mismatched).create(configuration(Sequence::AsReady)),
+        Err(Error::StoreAlreadyExists)
+    ));
+    assert!(memory::Memory::open_with_schema(&mismatched, &schema(2)).is_ok());
+
+    let foreign = directory.path().join("foreign.memory");
+    std::fs::write(&foreign, b"not a store\n").unwrap();
+    assert!(definition_at(&foreign).open().is_err());
+    assert!(matches!(
+        definition_at(&foreign).create(configuration(Sequence::AsReady)),
+        Err(Error::StoreAlreadyExists)
+    ));
+    assert_eq!(std::fs::read(&foreign).unwrap(), b"not a store\n");
+
+    let folder = directory.path().join("folder.memory");
+    std::fs::create_dir(&folder).unwrap();
+    assert!(matches!(
+        definition_at(&folder).open(),
+        Err(Error::StoreNotRegular)
+    ));
+    assert!(matches!(
+        definition_at(&folder).create(configuration(Sequence::AsReady)),
+        Err(Error::StoreAlreadyExists)
+    ));
+    assert_eq!(std::fs::read_dir(&folder).unwrap().count(), 0);
+}
+
+// RC1: competing creation cannot replace the winner. Catches a check-then-rename creation
+// (rename replaces the winner, so two creators succeed or the store holds a loser's
+// configuration), a create that opens an existing store as if it had created it, and a
+// loser that alters the winner's record.
+#[test]
+fn concurrent_creations_publish_exactly_one_store_and_never_replace_it() {
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join("raced.memory");
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+    let handles: Vec<_> = (0..8)
+        .map(|index| {
+            let barrier = barrier.clone();
+            let path = path.clone();
+            std::thread::spawn(move || {
+                let configuration = Configuration {
+                    history_length: HistoryLength(index),
+                    ..configuration(Sequence::AsReady)
+                };
+                barrier.wait();
+                (index, definition_at(&path).create(configuration))
+            })
+        })
+        .collect();
+    let results: Vec<_> = handles
+        .into_iter()
+        .map(|handle| handle.join().unwrap())
+        .collect();
+    let mut winners = Vec::new();
+    for (index, result) in &results {
+        match result {
+            Ok(_) => winners.push(*index),
+            Err(Error::StoreAlreadyExists) => {}
+            Err(error) => panic!("creator {index} failed otherwise: {error}"),
+        }
+    }
+    assert_eq!(winners.len(), 1, "creators that succeeded: {winners:?}");
+    let winner = winners[0];
+    drop(results);
+    let memory = definition_at(&path).open().unwrap();
+    assert_eq!(settings(&memory).history_length, HistoryLength(winner));
+    import(&memory, "kept", 1, "kept text");
+    let state = memory.inspect().unwrap();
+    drop(memory);
+    assert!(matches!(
+        definition_at(&path).create(configuration(Sequence::AsRecorded)),
+        Err(Error::StoreAlreadyExists)
+    ));
+    assert_eq!(
+        definition_at(&path).open().unwrap().inspect().unwrap(),
+        state
+    );
+}
+
+// RC5: create and open are distinct. Catches an open of a missing path that creates the
+// database or its parent directories (the pre-repair open created), a create that validates
+// after making the parent or staging (a refused configuration leaves debris), and a create
+// over an existing store that changes it.
+#[test]
+fn open_of_a_missing_path_makes_nothing_and_a_refused_create_leaves_nothing() {
+    let directory = TempDir::new().unwrap();
+    let nested = directory.path().join("absent").join("deeper");
+    let path = nested.join("state.memory");
+    assert!(matches!(
+        definition_at(&path).open(),
+        Err(Error::MissingStore)
+    ));
+    assert!(matches!(
+        definition(&directory).open(),
+        Err(Error::MissingStore)
+    ));
+    assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+    let unknown = configured(Sequence::AsReady, &["speech"], &["speech", "missing"]);
+    assert!(matches!(
+        definition_at(&path).create(unknown),
+        Err(Error::UnknownBackend(BackendName(text))) if text == "missing"
+    ));
+    let invalid = Configuration {
+        kilobits: Kilobits(0),
+        ..configuration(Sequence::AsReady)
+    };
+    assert!(matches!(
+        definition_at(&path).create(invalid),
+        Err(Error::InvalidConfiguration)
+    ));
+    assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+    let memory = definition_at(&path)
+        .create(configuration(Sequence::AsReady))
+        .unwrap();
+    capture(&memory, "kept", 1, "kept text");
+    let state = memory.inspect().unwrap();
+    drop(memory);
+    assert!(matches!(
+        definition_at(&path).create(configured(Sequence::AsRecorded, &[], &[])),
+        Err(Error::StoreAlreadyExists)
+    ));
+    assert_eq!(
+        definition_at(&path).open().unwrap().inspect().unwrap(),
+        state
+    );
+}
+
+// RC5: the persisted configuration is authoritative on open. Each policy is created in its
+// own store and reopened without a configuration; Recover then answers by the stored policy.
+// Catches an open that substitutes a default configuration of either policy (one of the two
+// stores then answers the other's way) and a create whose configuration is not the one that
+// persists.
+#[test]
+fn reopen_recovers_under_the_persisted_policy_of_each_separately_created_store() {
+    for (sequence, next) in [
+        (
+            Sequence::AsReady,
+            Next::Deliverable(ready("second", "two", Delivery::Kept)),
+        ),
+        (Sequence::AsRecorded, Next::Nothing),
+    ] {
+        let directory = TempDir::new().unwrap();
+        let memory = create(&directory, sequence.clone());
+        start(&memory, "first", 1);
+        stop(&memory, "first");
+        start(&memory, "second", 2);
+        stop(&memory, "second");
+        heard(&memory, "second", "two");
+        drop(memory);
+        let memory = reopen(&directory);
+        assert_eq!(settings(&memory).sequence, sequence);
+        assert_eq!(
+            execute(&memory, Input::Recover, 3, None).output,
+            Output::Recovered(Recovery {
+                hear: Hear(vec![JobId("first".into())]),
+                next,
+            })
+        );
+    }
+}
+
+// RC2: removing a selected backend while its job records. Tries keeps the job's selected
+// names that are still configured, in their order, with their current definitions. Catches
+// a removal refused while a job names the backend, Tries failing on the removed name (the
+// pre-repair UnknownBackend), Tries still offering the removed backend, Tries falling back
+// to the configured Order while a selected backend remains, a snapshot rewritten by the
+// removal, and an Order that keeps the removed name.
+#[test]
+fn removing_a_selected_backend_while_recording_keeps_the_remaining_selection_in_order() {
+    let directory = TempDir::new().unwrap();
+    let memory = definition(&directory)
+        .create(configured(
+            Sequence::AsRecorded,
+            &["speech", "whisper", "spare"],
+            &["spare", "speech"],
+        ))
+        .unwrap();
+    changed(
+        &memory,
+        overriding(&["speech", "whisper"]),
+        1,
+        Some("job"),
+        changes(&[("job", State::Recording)], &[]),
+    );
+    apply(&memory, Set::RemoveBackend(name("speech")));
+    let configuration = settings(&memory);
+    assert_eq!(
+        configuration.backend_vector,
+        vec![backend("whisper", "model"), backend("spare", "model")]
+    );
+    assert_eq!(configuration.order, Order(vec![name("spare")]));
+    stop(&memory, "job");
+    assert_eq!(
+        job(&memory.inspect().unwrap(), "job").backend_name_vector,
+        vec![name("speech"), name("whisper")]
+    );
+    assert_eq!(
+        observe(&memory, Input::Tries(JobId("job".into())), 2),
+        trial(vec![backend("whisper", "model")])
+    );
+    apply(&memory, Set::Backend(backend("whisper", "whisper-two")));
+    drop(memory);
+    let memory = reopen(&directory);
+    assert_eq!(
+        observe(&memory, Input::Tries(JobId("job".into())), 3),
+        trial(vec![backend("whisper", "whisper-two")])
+    );
+}
+
+// RC2: removing every selected backend while the job transcribes, then every backend. Tries
+// falls back to the configured Order, and with neither left offers nothing, so the caller
+// exhausts the job. Catches a job wedged by unresolvable names (Recover skipping it or Tries
+// failing), a fallback that ignores the configured Order, an empty Trial while the Order has
+// backends, a removal of an absent name refused, an exhausted job still blocking later
+// text, a retained terminal job that cannot be requeued after removal, and a requeued job
+// that does not take the post-removal Order.
+#[test]
+fn removing_every_backend_while_transcribing_falls_back_then_exhausts_without_wedging() {
+    let directory = TempDir::new().unwrap();
+    let memory = definition(&directory)
+        .create(configured(
+            Sequence::AsRecorded,
+            &["speech", "whisper", "spare"],
+            &["spare"],
+        ))
+        .unwrap();
+    changed(
+        &memory,
+        overriding(&["speech", "whisper"]),
+        1,
+        Some("job"),
+        changes(&[("job", State::Recording)], &[]),
+    );
+    stop(&memory, "job");
+    start(&memory, "later", 2);
+    stop(&memory, "later");
+    assert_eq!(heard(&memory, "later", "later text"), Next::Nothing);
+    apply(&memory, Set::RemoveBackend(name("speech")));
+    apply(&memory, Set::RemoveBackend(name("whisper")));
+    assert_eq!(
+        observe(&memory, Input::Tries(JobId("job".into())), 3),
+        trial(vec![backend("spare", "model")])
+    );
+    let before = memory.inspect().unwrap();
+    apply(&memory, Set::RemoveBackend(name("speech")));
+    assert_eq!(memory.inspect().unwrap(), before);
+    apply(&memory, Set::RemoveBackend(name("spare")));
+    let configuration = settings(&memory);
+    assert!(configuration.backend_vector.is_empty());
+    assert_eq!(configuration.order, Order(Vec::new()));
+    for id in ["job", "later"] {
+        assert_eq!(
+            observe(&memory, Input::Tries(JobId(id.into())), 4),
+            trial(Vec::new())
+        );
+    }
+    assert_eq!(
+        observe(&memory, turn(), 4),
+        Output::Turning(Turning::NoBackend)
+    );
+    drop(memory);
+    let memory = reopen(&directory);
+    assert_eq!(
+        execute(&memory, Input::Recover, 5, None).output,
+        Output::Recovered(Recovery {
+            hear: Hear(vec![JobId("job".into())]),
+            next: Next::Nothing,
+        })
+    );
+    assert_eq!(
+        observe(&memory, Input::Tries(JobId("job".into())), 5),
+        trial(Vec::new())
+    );
+    let exhausted = exhaust(&memory, "job", Vec::new());
+    assert_eq!(
+        exhausted,
+        Committed {
+            output: Output::Next(Next::Deliverable(ready(
+                "later",
+                "later text",
+                Delivery::Kept
+            ))),
+            changes: changes(&[("job", State::Failed)], &[]),
+        }
+    );
+    assert_eq!(finish(&memory, "later"), Next::Nothing);
+    changed(
+        &memory,
+        Input::Requeue(JobId("job".into())),
+        6,
+        None,
+        changes(&[("job", State::Transcribing)], &[]),
+    );
+    apply(&memory, Set::Backend(backend("fresh", "fresh-one")));
+    apply(&memory, Set::Order(vec![name("fresh")]));
+    assert_eq!(
+        observe(&memory, Input::Tries(JobId("job".into())), 7),
+        trial(vec![backend("fresh", "fresh-one")])
+    );
+}
+
+// RC3: invalid configuration values are refused as the meta InvalidValue unit, distinct from
+// UnknownBackend, with no committed change and state unchanged after reopen; each valid Set
+// commits exactly one Set. Catches a refusal surfaced as a Memory error (the pre-repair
+// shape), a range check off by one at an accepted boundary, a refusal that still writes or
+// reports the Set, an UnknownBackend reported as InvalidValue or the reverse, and a valid Set
+// that is lost on reopen.
+#[test]
+fn invalid_configuration_values_are_refused_as_invalid_value_with_no_committed_change() {
+    let directory = TempDir::new().unwrap();
+    let memory = create(&directory, Sequence::AsRecorded);
+    let base = configuration(Sequence::AsRecorded).recording_settings;
+    let recording = |change: fn(&mut RecordingSettings)| {
+        let mut settings = base.clone();
+        change(&mut settings);
+        Set::RecordingSettings(settings)
+    };
+    let budget = |steps: i64, depth: i64| {
+        Set::Budget(translator::DatomReadingBudget {
+            reading_steps: translator::ReadingSteps(steps),
+            reading_depth: translator::ReadingDepth(depth),
+        })
+    };
+    let timed = |seconds: i64| {
+        Set::Backend(Backend {
+            timeout: Timeout(Seconds(seconds)),
+            ..backend("speech", "model")
+        })
+    };
+    let invalid = [
+        Set::HistoryLength(HistoryLength(-1)),
+        Set::Kilobits(Kilobits(0)),
+        Set::Kilobits(Kilobits(-24)),
+        Set::AudioKept(Retention::Days(Days(-1))),
+        Set::TextKept(Retention::Days(Days(-1))),
+        timed(0),
+        timed(-30),
+        budget(0, 64),
+        budget(1024, 0),
+        budget(-1, 64),
+        recording(|settings| settings.sample_rate = SampleRate(12345)),
+        recording(|settings| settings.capture_fragment_bytes = CaptureFragmentBytes(0)),
+        recording(|settings| settings.capture_fragment_bytes = CaptureFragmentBytes(3)),
+        recording(|settings| settings.capture_buffer_bytes = CaptureBufferBytes(3836)),
+        recording(|settings| settings.capture_buffer_bytes = CaptureBufferBytes(15362)),
+        recording(|settings| settings.pending_pcm_frames = PendingPcmFrames(0)),
+        recording(|settings| settings.page_packets = PagePackets(0)),
+        recording(|settings| settings.encoding_complexity = EncodingComplexity(11)),
+        recording(|settings| settings.encoding_complexity = EncodingComplexity(-1)),
+        recording(|settings| settings.expected_packet_loss = ExpectedPacketLoss(101)),
+        recording(|settings| settings.expected_packet_loss = ExpectedPacketLoss(-1)),
+    ];
+    let before = memory.inspect().unwrap();
+    for set in invalid {
+        assert_eq!(
+            observe(&memory, Input::Apply(set.clone()), 1),
+            Output::Applying(Applying::InvalidValue),
+            "{set:?}"
+        );
+    }
+    for order in [vec![name("missing")], vec![name("speech"), name("missing")]] {
+        assert_eq!(
+            observe(&memory, Input::Apply(Set::Order(order)), 1),
+            Output::Applying(Applying::UnknownBackend(UnknownBackend(name("missing"))))
+        );
+    }
+    drop(memory);
+    let memory = reopen(&directory);
+    assert_eq!(memory.inspect().unwrap(), before);
+    let valid = [
+        Set::HistoryLength(HistoryLength(0)),
+        Set::Kilobits(Kilobits(1)),
+        Set::AudioKept(Retention::Days(Days(0))),
+        Set::TextKept(Retention::Days(Days(0))),
+        timed(1),
+        budget(1, 1),
+        recording(|settings| settings.encoding_complexity = EncodingComplexity(10)),
+        recording(|settings| settings.expected_packet_loss = ExpectedPacketLoss(100)),
+        Set::PasteProgram(Program("/fixture/paste-two".into())),
+        Set::CopyProgram(Program("/fixture/copy-two".into())),
+        Set::SecretProgram(Program("/fixture/secret-two".into())),
+        Set::AudioDirectory(Directory("/fixture/audio-two".into())),
+    ];
+    for set in valid {
+        apply(&memory, set);
+    }
+    let state = memory.inspect().unwrap();
+    drop(memory);
+    let memory = reopen(&directory);
+    assert_eq!(memory.inspect().unwrap(), state);
+    let configuration = settings(&memory);
+    assert_eq!(configuration.history_length, HistoryLength(0));
+    assert_eq!(
+        configuration.budget,
+        Budget(translator::DatomReadingBudget {
+            reading_steps: translator::ReadingSteps(1),
+            reading_depth: translator::ReadingDepth(1),
+        })
+    );
+    assert_eq!(
+        configuration.paste_program,
+        PasteProgram(Program("/fixture/paste-two".into()))
+    );
+    assert_eq!(
+        configuration.copy_program,
+        CopyProgram(Program("/fixture/copy-two".into()))
+    );
+    assert_eq!(
+        configuration.secret_program,
+        SecretProgram(Program("/fixture/secret-two".into()))
+    );
+    assert_eq!(
+        configuration.audio_directory,
+        AudioDirectory(Directory("/fixture/audio-two".into()))
+    );
+}
+
+// RC6: configured paths are lexically absolute and nonempty without NUL; Pulse names are
+// nonempty without NUL; nothing else is required of either. Each refused value is refused on
+// create (nothing made) and atomically on Set. Catches a relative or empty path accepted, a
+// NUL accepted, a path canonicalized or probed on the host (a nonexistent or non-canonical
+// absolute path refused, or stored rewritten), and an invented Pulse syntax that refuses a
+// nonempty name.
+#[test]
+fn paths_must_be_absolute_and_pulse_names_nonempty_without_nul_on_create_and_set() {
+    let accepted_paths = [
+        "/",
+        "/nonexistent/listener/fixture",
+        "/fixture/a/../b",
+        "/fixture//double",
+        "/fixture/with space",
+    ];
+    let refused_paths = [
+        "", "relative", "./paste", "../paste", "~/paste", "/pa\0ste", "\0",
+    ];
+    let path_sets: [fn(&str) -> Set; 4] = [
+        |text| Set::PasteProgram(Program(text.into())),
+        |text| Set::CopyProgram(Program(text.into())),
+        |text| Set::SecretProgram(Program(text.into())),
+        |text| Set::AudioDirectory(Directory(text.into())),
+    ];
+    let accepted_names = ["listener", "Listener Fixture", "not:a//pulse name", "x"];
+    let refused_names = ["", "list\0ener"];
+    let base = configuration(Sequence::AsReady).recording_settings;
+    let named = |text: &str| {
+        Set::RecordingSettings(RecordingSettings {
+            pulse_application_name: PulseApplicationName(text.into()),
+            ..base.clone()
+        })
+    };
+    let served = |text: &str| {
+        Set::RecordingSettings(RecordingSettings {
+            pulse_server: PulseServer::Named(AudioServerAddress(text.into())),
+            ..base.clone()
+        })
+    };
+    let mut refused: Vec<Set> = Vec::new();
+    for set in path_sets {
+        refused.extend(refused_paths.iter().map(|text| set(text)));
+    }
+    refused.extend(refused_names.iter().map(|text| named(text)));
+    refused.extend(refused_names.iter().map(|text| served(text)));
+    let mut accepted: Vec<Set> = Vec::new();
+    for set in path_sets {
+        accepted.extend(accepted_paths.iter().map(|text| set(text)));
+    }
+    accepted.extend(accepted_names.iter().map(|text| named(text)));
+    accepted.extend(
+        [
+            "unix:/run/user/1000/pulse/native",
+            "tcp:localhost:4713",
+            "localhost",
+        ]
+        .iter()
+        .map(|text| served(text)),
+    );
+
+    let directory = TempDir::new().unwrap();
+    let refused_create = directory.path().join("refused").join("state.memory");
+    for set in &refused {
+        assert!(
+            matches!(
+                definition_at(&refused_create)
+                    .create(configured_with(configuration(Sequence::AsReady), set)),
+                Err(Error::InvalidConfiguration)
+            ),
+            "{set:?}"
+        );
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+    }
+    let mut memory = create(&directory, Sequence::AsReady);
+    capture(&memory, "kept", 1, "kept text");
+    let before = memory.inspect().unwrap();
+    for set in &refused {
+        assert_eq!(
+            observe(&memory, Input::Apply(set.clone()), 2),
+            Output::Applying(Applying::InvalidValue),
+            "{set:?}"
+        );
+    }
+    drop(memory);
+    memory = reopen(&directory);
+    assert_eq!(memory.inspect().unwrap(), before);
+    for set in accepted {
+        let expected = configured_with(settings(&memory), &set);
+        apply(&memory, set.clone());
+        drop(memory);
+        memory = reopen(&directory);
+        assert_eq!(settings(&memory), expected, "{set:?}");
+        let accepted_create = directory.path().join("accepted").join("state.memory");
+        let created = definition_at(&accepted_create)
+            .create(configured_with(configuration(Sequence::AsReady), &set))
+            .unwrap();
+        assert_eq!(
+            settings(&created),
+            configured_with(configuration(Sequence::AsReady), &set)
+        );
+        drop(created);
+        std::fs::remove_dir_all(directory.path().join("accepted")).unwrap();
+    }
+    assert_eq!(
+        job(&memory.inspect().unwrap(), "kept").audio,
+        Audio::Kept(Directory("/fixture/audio-before".into()))
+    );
+}
+
+// RC4: an unknown override backend is refused as the shared UnknownBackend naming the first
+// unknown name, distinct from NoBackend, with nothing recorded. Catches an override that
+// starts a recording and fails later, a refusal that names the wrong backend or commits a
+// job (the refused identity then cannot start a recording), an empty override treated as
+// unknown or as the configured Order, and an override checked against the Order instead of
+// the configured backends.
+#[test]
+fn an_unknown_override_backend_is_refused_by_name_and_records_nothing() {
+    let directory = TempDir::new().unwrap();
+    let memory = definition(&directory)
+        .create(configured(
+            Sequence::AsReady,
+            &["speech", "whisper"],
+            &["speech"],
+        ))
+        .unwrap();
+    let before = memory.inspect().unwrap();
+    for names in [&["missing"][..], &["speech", "missing", "absent"][..]] {
+        assert_eq!(
+            execute(&memory, overriding(names), 1, Some("job")),
+            Committed {
+                output: Output::Turning(Turning::UnknownBackend(UnknownBackend(name("missing")))),
+                changes: changes(&[], &[]),
+            }
+        );
+    }
+    assert_eq!(
+        execute(&memory, overriding(&[]), 1, Some("job")),
+        Committed {
+            output: Output::Turning(Turning::NoBackend),
+            changes: changes(&[], &[]),
+        }
+    );
+    assert_eq!(memory.inspect().unwrap(), before);
+    changed(
+        &memory,
+        overriding(&["whisper"]),
+        1,
+        Some("job"),
+        changes(&[("job", State::Recording)], &[]),
+    );
+    assert_eq!(
+        job(&memory.inspect().unwrap(), "job").backend_name_vector,
+        vec![name("whisper")]
+    );
+}
+
+// RC4: Requeue of a job still in progress is refused as InProgress carrying its JobState;
+// terminal jobs keep their own answers. Catches a Requeue that resets a recording,
+// transcribing or waiting job (losing its delivery claim or tries), an InProgress that carries
+// a wrong or fixed state, a nonterminal job answered NoAudio or Requeued, a terminal job
+// answered InProgress, and the pre-repair order that tested audio before state (see the
+// crafted case below).
+#[test]
+fn requeue_refuses_in_progress_jobs_with_their_state_and_answers_terminal_jobs_by_audio() {
+    let directory = TempDir::new().unwrap();
+    let memory = create(&directory, Sequence::AsReady);
+    capture(&memory, "delivered", 1, "spoken");
+    import(&memory, "imported", 2, "remembered");
+    start(&memory, "failed", 3);
+    stop(&memory, "failed");
+    exhaust(&memory, "failed", Vec::new());
+    start(&memory, "transcribing", 4);
+    stop(&memory, "transcribing");
+    start(&memory, "waiting", 5);
+    stop(&memory, "waiting");
+    assert_eq!(ready_id(heard(&memory, "waiting", "ready")), "waiting");
+    start(&memory, "recording", 6);
+    for (id, state) in [
+        ("recording", State::Recording),
+        ("transcribing", State::Transcribing),
+        ("waiting", State::Waiting),
+    ] {
+        assert_eq!(
+            observe(&memory, Input::Requeue(JobId(id.into())), 7),
+            Output::Requeueing(Requeueing::InProgress(JobState {
+                job_id: JobId(id.into()),
+                state,
+            }))
+        );
+    }
+    assert_eq!(
+        observe(&memory, Input::Requeue(JobId("imported".into())), 7),
+        Output::Requeueing(Requeueing::NoAudio(signal_listener::NoAudio(JobId(
+            "imported".into()
+        ))))
+    );
+    assert_eq!(
+        observe(&memory, Input::Requeue(JobId("missing".into())), 7),
+        Output::Requeueing(Requeueing::NoSuchJob(signal_listener::NoSuchJob(JobId(
+            "missing".into()
+        ))))
+    );
+    for id in ["delivered", "failed"] {
+        assert_eq!(
+            changed(
+                &memory,
+                Input::Requeue(JobId(id.into())),
+                7,
+                None,
+                changes(&[(id, State::Transcribing)], &[]),
+            ),
+            Output::Requeueing(Requeueing::Requeued(JobId(id.into())))
+        );
+    }
+    assert_eq!(finish(&memory, "waiting"), Next::Nothing);
+}
+
+// RC4 priority: a job both in progress and without audio answers InProgress. No public
+// operation reaches that state, so the record is written into the kernel store by hand and
+// opened. Catches the pre-repair order, which answered NoAudio before testing state.
+#[test]
+fn in_progress_takes_priority_over_missing_audio_for_requeue() {
+    let directory = TempDir::new().unwrap();
+    let memory = create(&directory, Sequence::AsReady);
+    start(&memory, "erased", 1);
+    stop(&memory, "erased");
+    let path = memory.path().unwrap();
+    let mut record = memory.inspect().unwrap();
+    drop(memory);
+    record.job_vector[0].audio = Audio::Erased;
+    write_record(&path, &record);
+    let memory = reopen(&directory);
+    assert_eq!(memory.inspect().unwrap(), record);
+    assert_eq!(
+        observe(&memory, Input::Requeue(JobId("erased".into())), 2),
+        Output::Requeueing(Requeueing::InProgress(JobState {
+            job_id: JobId("erased".into()),
+            state: State::Transcribing,
+        }))
+    );
+}
+
+// RC3/RC4 contract shapes: the ordinary Refused carries the shared UnknownBackend and
+// InProgress(JobState); the meta Refused carries the same shared UnknownBackend and the unit
+// InvalidValue. Catches a per-contract UnknownBackend type (this does not compile then), an
+// InProgress without its JobState, an InvalidValue carrying data, a generated dispatch that
+// drops a refusal, and an archive that does not round-trip the refusals.
+#[test]
+fn ordinary_and_meta_refusals_share_unknown_backend_and_dispatch_through_answering() {
+    use signal_listener::{Answer, Answerable, Answering, Refused_Data};
+    let unknown: UnknownBackend = UnknownBackend(name("missing"));
+    let progress = JobState {
+        job_id: JobId("job".into()),
+        state: State::Waiting,
+    };
+    // One value of the one shared type fills every refusal that names an unknown backend:
+    // Memory's Turning and Applying, and both wire contracts below.
+    let _: [Output; 2] = [
+        Output::Turning(Turning::UnknownBackend(unknown.clone())),
+        Output::Applying(Applying::UnknownBackend(unknown.clone())),
+    ];
+    struct Fixture {
+        unknown: UnknownBackend,
+        progress: JobState,
+    }
+    impl Answering for Fixture {
+        fn toggle(&self) -> Result<signal_listener::Toggling, signal_listener::Output> {
+            Err(signal_listener::Output::Refused(Refused_Data::NoBackend))
+        }
+        fn toggle_custom(
+            &self,
+            _: &Options,
+        ) -> Result<signal_listener::Toggling, signal_listener::Output> {
+            Err(signal_listener::Output::Refused(
+                Refused_Data::UnknownBackend(self.unknown.clone()),
+            ))
+        }
+        fn cancel(&self) -> Result<JobId, signal_listener::Output> {
+            Err(signal_listener::Output::Refused(
+                Refused_Data::NothingRecording,
+            ))
+        }
+        fn recall(&self) -> Result<Text, signal_listener::Output> {
+            Err(signal_listener::Output::Refused(Refused_Data::NothingKept))
+        }
+        fn recall_job(&self, job_id: &JobId) -> Result<Text, signal_listener::Output> {
+            Err(signal_listener::Output::Refused(Refused_Data::NoSuchJob(
+                signal_listener::NoSuchJob(job_id.clone()),
+            )))
+        }
+        fn retranscribe(&self, _: &JobId) -> Result<JobId, signal_listener::Output> {
+            Err(signal_listener::Output::Refused(Refused_Data::InProgress(
+                self.progress.clone(),
+            )))
+        }
+        fn jobs(&self) -> Result<Vec<JobState>, signal_listener::Output> {
+            Ok(vec![self.progress.clone()])
+        }
+        fn history(&self) -> Result<Vec<Past>, signal_listener::Output> {
+            Ok(Vec::new())
+        }
+        fn subscribe(
+            &self,
+        ) -> Result<signal::Stream<Vec<JobState>, JobState>, signal_listener::Output> {
+            Err(signal_listener::Output::Refused(Refused_Data::Unwritable))
+        }
+    }
+    let fixture = Fixture {
+        unknown: unknown.clone(),
+        progress: progress.clone(),
+    };
+    for (input, expected) in [
+        (
+            signal_listener::Input::ToggleCustom(Options {
+                delivery_option: None,
+                backend_name_vector_option: Some(vec![name("missing")]),
+            }),
+            Refused_Data::UnknownBackend(unknown.clone()),
+        ),
+        (
+            signal_listener::Input::Retranscribe(JobId("job".into())),
+            Refused_Data::InProgress(progress.clone()),
+        ),
+    ] {
+        let Answer::Once(output) = input.answer(&fixture) else {
+            panic!("one-shot input yielded a stream")
+        };
+        let expected = signal_listener::Output::Refused(expected);
+        assert_eq!(output, expected);
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&output).unwrap();
+        assert_eq!(
+            rkyv::from_bytes::<signal_listener::Output, rkyv::rancor::Error>(&bytes).unwrap(),
+            expected
+        );
+    }
+
+    struct Meta {
+        unknown: UnknownBackend,
+    }
+    impl meta_signal_listener::Answering for Meta {
+        fn configure(&self, set: &Set) -> Result<Set, meta_signal_listener::Output> {
+            Err(meta_signal_listener::Output::Refused(match set {
+                Set::Order(_) => {
+                    meta_signal_listener::Refused_Data::UnknownBackend(self.unknown.clone())
+                }
+                _ => meta_signal_listener::Refused_Data::InvalidValue,
+            }))
+        }
+        fn configuration(&self) -> Result<Configuration, meta_signal_listener::Output> {
+            Ok(configuration(Sequence::AsReady))
+        }
+        fn remember(
+            &self,
+            _: &meta_signal_listener::Remember_Data,
+        ) -> Result<JobId, meta_signal_listener::Output> {
+            Ok(JobId("remembered".into()))
+        }
+        fn subscribe(
+            &self,
+        ) -> Result<signal::Stream<Configuration, Set>, meta_signal_listener::Output> {
+            Err(meta_signal_listener::Output::Refused(
+                meta_signal_listener::Refused_Data::InvalidValue,
+            ))
+        }
+    }
+    use meta_signal_listener::Answerable as _;
+    let meta = Meta {
+        unknown: unknown.clone(),
+    };
+    for (set, expected) in [
+        (
+            Set::Order(vec![name("missing")]),
+            meta_signal_listener::Refused_Data::UnknownBackend(unknown.clone()),
+        ),
+        (
+            Set::HistoryLength(HistoryLength(-1)),
+            meta_signal_listener::Refused_Data::InvalidValue,
+        ),
+    ] {
+        let meta_signal_listener::Answer::Once(output) =
+            meta_signal_listener::Input::Configure(set).answer(&meta)
+        else {
+            panic!("one-shot input yielded a stream")
+        };
+        let expected = meta_signal_listener::Output::Refused(expected);
+        assert_eq!(output, expected);
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&output).unwrap();
+        assert_eq!(
+            rkyv::from_bytes::<meta_signal_listener::Output, rkyv::rancor::Error>(&bytes).unwrap(),
+            expected
+        );
+    }
+}
+
+// RC3/RC4 Datom spelling of the refusals. Catches a renamed refusal, an InvalidValue that
+// takes an argument, an InProgress without its JobState, and the pre-repair meta shape in
+// which Refused carried the backend name directly.
+#[cfg(feature = "datom")]
+#[test]
+fn datom_spells_the_ruled_refusals() {
+    let ordinary: signal_listener::Output = decode("Refused.InProgress.{ job Waiting }").unwrap();
+    assert_eq!(
+        ordinary,
+        signal_listener::Output::Refused(signal_listener::Refused_Data::InProgress(JobState {
+            job_id: JobId("job".into()),
+            state: State::Waiting,
+        }))
+    );
+    let ordinary: signal_listener::Output = decode("Refused.UnknownBackend.missing").unwrap();
+    assert_eq!(
+        ordinary,
+        signal_listener::Output::Refused(signal_listener::Refused_Data::UnknownBackend(
+            UnknownBackend(name("missing"))
+        ))
+    );
+    let meta: meta_signal_listener::Output = decode("Refused.InvalidValue").unwrap();
+    assert_eq!(
+        meta,
+        meta_signal_listener::Output::Refused(meta_signal_listener::Refused_Data::InvalidValue)
+    );
+    for refused in [
+        "Refused.missing",
+        "Refused.InvalidValue.missing",
+        "Refused.Invalidvalue",
+    ] {
+        assert!(
+            decode::<meta_signal_listener::Output>(refused).is_err(),
+            "{refused}"
+        );
+    }
+    assert!(decode::<signal_listener::Output>("Refused.InProgress.job").is_err());
+}
+
+// RC11: Pending (the Jobs query and the subscription snapshot) holds every retained job
+// that is not Delivered, Failed and Cancelled included, at every commit and across reopen.
+// The expected membership is written by hand at each step; how a retirement is announced
+// on the stream is not asserted. Catches the pre-repair filter that dropped Failed and
+// Cancelled jobs, a Pending that keeps Delivered or imported jobs, a requeued job that does
+// not return, and a job retired from the store that stays listed.
+#[test]
+fn pending_lists_every_retained_job_but_delivered_ones_across_transitions_and_reopen() {
+    use std::collections::BTreeMap;
+    fn expect(memory: &listener_memory::Memory, jobs: &[(&str, State)]) {
+        let expected: BTreeMap<String, State> = jobs
+            .iter()
+            .map(|(id, state)| ((*id).to_string(), state.clone()))
+            .collect();
+        assert_eq!(standing(memory), expected);
+        let retained: BTreeMap<String, State> = memory
+            .inspect()
+            .unwrap()
+            .job_vector
+            .iter()
+            .filter(|job| job.state != State::Delivered)
+            .map(|job| (job.job_id.0.clone(), job.state.clone()))
+            .collect();
+        assert_eq!(retained, expected);
+    }
+    use State::{Cancelled, Failed, Recording, Transcribing, Waiting};
+    let directory = TempDir::new().unwrap();
+    let memory = create(&directory, Sequence::AsReady);
+    expect(&memory, &[]);
+    start(&memory, "failed", 1);
+    expect(&memory, &[("failed", Recording)]);
+    stop(&memory, "failed");
+    expect(&memory, &[("failed", Transcribing)]);
+    exhaust(&memory, "failed", Vec::new());
+    expect(&memory, &[("failed", Failed)]);
+    start(&memory, "cancelled", 2);
+    execute(&memory, Input::Drop, 2, None);
+    expect(&memory, &[("failed", Failed), ("cancelled", Cancelled)]);
+    capture(&memory, "delivered", 3, "spoken");
+    import(&memory, "imported", 4, "remembered");
+    expect(&memory, &[("failed", Failed), ("cancelled", Cancelled)]);
+    start(&memory, "waiting", 5);
+    stop(&memory, "waiting");
+    heard(&memory, "waiting", "ready");
+    start(&memory, "recording", 6);
+    let everything = [
+        ("failed", Failed),
+        ("cancelled", Cancelled),
+        ("waiting", Waiting),
+        ("recording", Recording),
+    ];
+    expect(&memory, &everything);
+    execute(&memory, Input::Requeue(JobId("delivered".into())), 7, None);
+    execute(&memory, Input::Requeue(JobId("failed".into())), 7, None);
+    expect(
+        &memory,
+        &[
+            ("failed", Transcribing),
+            ("cancelled", Cancelled),
+            ("delivered", Transcribing),
+            ("waiting", Waiting),
+            ("recording", Recording),
+        ],
+    );
+    exhaust(&memory, "failed", Vec::new());
+    heard(&memory, "delivered", "spoken again");
+    assert_eq!(
+        finish(&memory, "waiting"),
+        Next::Deliverable(ready("delivered", "spoken again", Delivery::Kept))
+    );
+    assert_eq!(finish(&memory, "delivered"), Next::Nothing);
+    expect(
+        &memory,
+        &[
+            ("failed", Failed),
+            ("cancelled", Cancelled),
+            ("recording", Recording),
+        ],
+    );
+    apply(&memory, Set::AudioKept(Retention::Days(Days(0))));
+    execute(&memory, Input::Prune, 10, None);
+    expect(
+        &memory,
+        &[
+            ("failed", Failed),
+            ("cancelled", Cancelled),
+            ("recording", Recording),
+        ],
+    );
+    execute(
+        &memory,
+        Input::Forget(vec![location("/fixture/audio-before", "cancelled")]),
+        10,
+        None,
+    );
+    expect(&memory, &[("failed", Failed), ("recording", Recording)]);
+    drop(memory);
+    let memory = reopen(&directory);
+    expect(&memory, &[("failed", Failed), ("recording", Recording)]);
+    execute(&memory, Input::Recover, 11, None);
+    expect(&memory, &[("failed", Failed), ("recording", Transcribing)]);
+    execute(
+        &memory,
+        Input::Forget(vec![location("/fixture/audio-before", "failed")]),
+        12,
+        None,
+    );
+    expect(&memory, &[("recording", Transcribing)]);
 }
