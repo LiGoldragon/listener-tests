@@ -1,0 +1,31 @@
+[package]
+name = "listener-tests"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/LiGoldragon/listener-tests"
+publish = false
+
+[features]
+default = []
+datom = ["dep:datom-codec", "listener-library/datom", "signal-listener/datom", "meta-signal-listener/datom", "listener-memory/datom", "signal/datom", "translator/datom", "nexus/datom"]
+
+[dependencies]
+nexus = { git = "https://github.com/LiGoldragon/nexus", rev = "ea4db5a51083f114c624fc23c023c7a255376846", default-features = false }
+listener-library = { git = "https://github.com/LiGoldragon/listener-library", rev = "3549987a7fa5eaab826f21521d5d6a3a23a7d8d7", default-features = false }
+signal-listener = { git = "https://github.com/LiGoldragon/signal-listener", rev = "57f69f061b797bdbdcce3d831b9d3a85513b835f", default-features = false }
+meta-signal-listener = { git = "https://github.com/LiGoldragon/meta-signal-listener", rev = "b85ed9632e1483234b56ece0c0e675cb69b7990e", default-features = false }
+listener-memory = { git = "https://github.com/LiGoldragon/listener", rev = "405fe7a53af72ea5f7cd32575b6198c558aec80a", default-features = false }
+translator = { git = "https://github.com/LiGoldragon/translator", rev = "8d26df34e13291f34fcda85513c86e6f7c271405", default-features = false }
+signal = { git = "https://github.com/LiGoldragon/signal", rev = "4f5cbb9", default-features = false }
+memory = { git = "https://github.com/LiGoldragon/memory", rev = "e78519c2fc8f213246328bf28f9e38f9a216f76e" }
+rkyv = { version = "0.8", default-features = false, features = ["std", "bytecheck", "little_endian", "pointer_width_32", "unaligned"] }
+datom-codec = { git = "https://github.com/LiGoldragon/datom-codec", rev = "09a0526", optional = true }
+tempfile = "3"
+futures-util = { version = "0.3.34", default-features = false, features = ["std", "async-await-macro", "channel", "io", "sink"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+unused = { level = "warn", priority = -1 }
+dead_code = "warn"
