@@ -4,6 +4,7 @@ use listener_memory::{
     operations::*, state::Audio,
 };
 use meta_signal_listener::Set;
+use signal_listener::JobChange;
 use tempfile::TempDir;
 
 // These constructors are test fixtures, not production entry points or clocks.
@@ -98,11 +99,11 @@ fn start(memory: &listener_memory::Memory, id: &str, moment: i64) -> Fresh_Data 
         Some(id),
     );
     assert_eq!(
-        result.changes.job_state_vector,
-        vec![JobState {
+        result.changes.job_change_vector,
+        vec![JobChange::JobState(JobState {
             job_id: JobId(id.into()),
             state: State::Recording
-        }]
+        })]
     );
     let Output::Turning(Turning::Fresh(fresh)) = result.output else {
         panic!("fresh recording expected")
@@ -211,17 +212,24 @@ fn job<'record>(
         .find(|job| job.job_id.0 == id)
         .expect("job present")
 }
-// The exact change record a commit is expected to report; no Set unless one applied.
-fn changes(states: &[(&str, State)], retired: &[&str]) -> Changes {
+// The exact change record a commit is expected to report: each changed job's new state, then
+// each job that left Memory as Forgotten; no Set unless one applied.
+fn changes(states: &[(&str, State)], forgotten: &[&str]) -> Changes {
     Changes {
-        job_state_vector: states
+        job_change_vector: states
             .iter()
-            .map(|(id, state)| JobState {
-                job_id: JobId((*id).into()),
-                state: state.clone(),
+            .map(|(id, state)| {
+                JobChange::JobState(JobState {
+                    job_id: JobId((*id).into()),
+                    state: state.clone(),
+                })
             })
+            .chain(
+                forgotten
+                    .iter()
+                    .map(|id| JobChange::Forgotten(JobId((*id).into()))),
+            )
             .collect(),
-        retired: Retired(retired.iter().map(|id| JobId((*id).into())).collect()),
         set_option: None,
     }
 }
@@ -541,13 +549,13 @@ fn text_and_audio_expire_independently_and_only_matching_successful_deletions_ar
         execute(&memory, Input::Prune, 86401, None).output,
         Output::Pruned(locations)
     );
-    let retired = execute(
+    let forgotten = execute(
         &memory,
         Input::Forget(vec![first.audio_location]),
         86401,
         None,
     );
-    assert_eq!(retired.changes.retired.0, vec![JobId("first".into())]);
+    assert_eq!(forgotten.changes, changes(&[], &["first"]));
     assert_eq!(
         execute(&memory, Input::Prune, 86401, None).output,
         Output::Pruned(vec![second.audio_location])
@@ -592,7 +600,7 @@ fn audio_expiry_preserves_text_and_recall_until_text_expiry() {
         None,
     );
     let result = execute(&memory, Input::Prune, 10, None);
-    assert_eq!(result.changes.retired.0, vec![JobId("job".into())]);
+    assert_eq!(result.changes, changes(&[], &["job"]));
     assert!(memory.inspect().unwrap().job_vector.is_empty());
 }
 
@@ -676,11 +684,8 @@ fn restart_returns_only_the_accepted_work_plan_and_normalizes_recording() {
         State::Transcribing
     );
     assert_eq!(
-        result.changes.job_state_vector,
-        vec![JobState {
-            job_id: JobId("recording".into()),
-            state: State::Transcribing
-        }]
+        result.changes,
+        changes(&[("recording", State::Transcribing)], &[])
     );
 }
 
@@ -825,19 +830,28 @@ fn every_generated_ordinary_input_uses_its_paired_answering_capability() {
     #[derive(Clone)]
     struct Jobs(Vec<JobState>);
 
+    // The ruled fold: a JobState inserts or replaces its job, and Delivered or Forgotten
+    // removes it.
     impl Following for Jobs {
-        type Change = JobState;
+        type Change = JobChange;
 
-        fn after(mut state: Self, change: JobState) -> Self {
-            state.0.retain(|job| job.job_id != change.job_id);
-            state.0.push(change);
+        fn after(mut state: Self, change: JobChange) -> Self {
+            match change {
+                JobChange::JobState(job) => {
+                    state.0.retain(|kept| kept.job_id != job.job_id);
+                    if job.state != State::Delivered {
+                        state.0.push(job);
+                    }
+                }
+                JobChange::Forgotten(id) => state.0.retain(|kept| kept.job_id != id),
+            }
             state
         }
     }
     struct Fixture {
         id: JobId,
         text: Text,
-        jobs: Publisher<Jobs, JobState>,
+        jobs: Publisher<Jobs, JobChange>,
     }
     impl Answering for Fixture {
         fn toggle(&self) -> Result<signal_listener::Toggling, signal_listener::Output> {
@@ -869,7 +883,7 @@ fn every_generated_ordinary_input_uses_its_paired_answering_capability() {
         }
         fn subscribe(
             &self,
-        ) -> Result<signal::Stream<Vec<JobState>, JobState>, signal_listener::Output> {
+        ) -> Result<signal::Stream<Vec<JobState>, JobChange>, signal_listener::Output> {
             let frames = self.jobs.open().map(|frame| match frame {
                 Frame::Opened(jobs) => Frame::Opened(jobs.0),
                 Frame::Changed(job) => Frame::Changed(job),
@@ -947,7 +961,7 @@ fn every_generated_ordinary_input_uses_its_paired_answering_capability() {
         17,
         Some(&fixture.id.0),
     );
-    let [change] = &committed.changes.job_state_vector[..] else {
+    let [change] = &committed.changes.job_change_vector[..] else {
         panic!("import must return one committed change")
     };
     fixture.jobs.publish(change.clone());
@@ -1559,108 +1573,285 @@ fn every_commit_reports_exactly_its_state_changes_and_queries_change_nothing() {
     assert_eq!(reopen(&directory).inspect().unwrap(), state);
 }
 
-// RC13 coverage: Jobs stream projection, restricted to active jobs until the membership ruling
-// (RC11). Catches a commit that moves an active job without reporting it (Interrupt, Requeue
-// back to Transcribing, Recover's normalization after reopen), a Pending query that omits
-// Waiting or interrupted jobs or lists a cancelled one, and a retirement left in the view.
-#[test]
-fn committed_changes_fold_to_the_pending_query_for_active_jobs() {
-    struct View {
-        jobs: std::collections::BTreeMap<String, State>,
-    }
-    impl View {
-        fn active(
-            jobs: impl IntoIterator<Item = (String, State)>,
-        ) -> std::collections::BTreeMap<String, State> {
-            jobs.into_iter()
-                .filter(|(_, state)| {
-                    !matches!(state, State::Delivered | State::Failed | State::Cancelled)
-                })
-                .collect()
-        }
-        fn follow(
-            &mut self,
-            memory: &listener_memory::Memory,
-            input: Input,
-            moment: i64,
-            id: Option<&str>,
-        ) {
-            let committed = execute(memory, input, moment, id);
-            for change in committed.changes.job_state_vector {
-                self.jobs.insert(change.job_id.0, change.state);
-            }
-            for retired in committed.changes.retired.0 {
-                self.jobs.remove(&retired.0);
-            }
-            let Output::Standing(pending) = observe(memory, Input::Pending, moment) else {
-                panic!("pending jobs expected")
+// The Jobs stream as a subscriber holds it: the Opened snapshot, then each committed change in
+// order. The ruled fold: a JobState inserts or replaces its job, a Delivered JobState removes
+// it, and Forgotten removes it. The other foldings are deliberately wrong subscribers, kept
+// beside the ruled one so the scenario below proves it reaches every removal path.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Folding {
+    Ruled,
+    KeepsDelivered,
+    IgnoresForgotten,
+    DropsFailedAndCancelled,
+}
+type JobView = std::collections::BTreeMap<String, State>;
+fn fold(folding: Folding, mut jobs: JobView, change: &JobChange) -> JobView {
+    match change {
+        JobChange::JobState(job) => {
+            let leaves = match folding {
+                Folding::KeepsDelivered => false,
+                Folding::DropsFailedAndCancelled => {
+                    matches!(
+                        job.state,
+                        State::Delivered | State::Failed | State::Cancelled
+                    )
+                }
+                Folding::Ruled | Folding::IgnoresForgotten => job.state == State::Delivered,
             };
-            assert_eq!(
-                Self::active(self.jobs.clone()),
-                Self::active(pending.into_iter().map(|job| (job.job_id.0, job.state))),
-                "after {:?}",
-                committed.output
-            );
+            if leaves {
+                jobs.remove(&job.job_id.0);
+            } else {
+                jobs.insert(job.job_id.0.clone(), job.state.clone());
+            }
+        }
+        JobChange::Forgotten(id) => {
+            if folding != Folding::IgnoresForgotten {
+                jobs.remove(&id.0);
+            }
         }
     }
-    let directory = TempDir::new().unwrap();
-    let memory = create(&directory, Sequence::AsRecorded);
-    let Output::Standing(opened) = observe(&memory, Input::Pending, 0) else {
-        panic!("pending jobs expected")
-    };
-    let mut view = View {
-        jobs: opened
+    jobs
+}
+struct Subscriber {
+    views: Vec<(Folding, JobView, bool)>,
+}
+impl Subscriber {
+    fn open(memory: &listener_memory::Memory) -> Self {
+        let opened = standing(memory);
+        Self {
+            views: [
+                Folding::Ruled,
+                Folding::KeepsDelivered,
+                Folding::IgnoresForgotten,
+                Folding::DropsFailedAndCancelled,
+            ]
             .into_iter()
-            .map(|job| (job.job_id.0, job.state))
+            .map(|folding| (folding, opened.clone(), false))
             .collect(),
-    };
-    view.follow(&memory, turn(), 1, Some("delivered"));
-    view.follow(&memory, turn(), 1, None);
-    view.follow(&memory, hearing("delivered", "text"), 1, None);
-    view.follow(&memory, finishing("delivered"), 1, None);
-    view.follow(&memory, turn(), 2, Some("failed"));
-    view.follow(&memory, turn(), 2, None);
-    view.follow(
+        }
+    }
+    fn ruled(&self) -> &JobView {
+        &self.views[0].1
+    }
+    // The ruled view equals a fresh Pending query; a wrong folding is recorded when it differs.
+    fn agree(&mut self, memory: &listener_memory::Memory, after: &str) {
+        let pending = standing(memory);
+        for (folding, view, diverged) in &mut self.views {
+            if *folding == Folding::Ruled {
+                assert_eq!(
+                    *view, pending,
+                    "the ruled fold differs from Pending after {after}"
+                );
+            } else if *view != pending {
+                *diverged = true;
+            }
+        }
+    }
+    fn follow(
+        &mut self,
+        memory: &listener_memory::Memory,
+        input: Input,
+        moment: i64,
+        id: Option<&str>,
+    ) -> Committed {
+        let after = format!("{input:?}");
+        let committed = execute(memory, input, moment, id);
+        for (folding, view, _) in &mut self.views {
+            for change in &committed.changes.job_change_vector {
+                *view = fold(*folding, std::mem::take(view), change);
+            }
+        }
+        self.agree(memory, &after);
+        committed
+    }
+    // A refusal commits nothing, so nothing reaches the stream.
+    fn refuse(&mut self, memory: &listener_memory::Memory, input: Input, moment: i64) -> Output {
+        let after = format!("{input:?}");
+        let output = observe(memory, input, moment);
+        self.agree(memory, &after);
+        output
+    }
+    // A failed operation returns no Committed, so it has no change to publish, and leaves the
+    // store as it was.
+    fn fail(
+        &mut self,
+        memory: &listener_memory::Memory,
+        input: Input,
+        moment: i64,
+        id: Option<&str>,
+    ) {
+        let after = format!("{input:?}");
+        let before = memory.inspect().unwrap();
+        assert!(
+            memory.execute(request(input, moment, id)).is_err(),
+            "{after} was expected to fail"
+        );
+        assert_eq!(memory.inspect().unwrap(), before);
+        self.agree(memory, &after);
+    }
+}
+fn forgotten_ids(committed: &Committed) -> std::collections::BTreeSet<String> {
+    committed
+        .changes
+        .job_change_vector
+        .iter()
+        .map(|change| match change {
+            JobChange::Forgotten(id) => id.0.clone(),
+            JobChange::JobState(job) => panic!("only Forgotten expected, found {job:?}"),
+        })
+        .collect()
+}
+
+// The Jobs stream's fold equals Pending through the whole ruled lifecycle: recording,
+// transcribing (stop, Interrupt, Requeue, Recover after reopen), waiting, delivered, failed,
+// cancelled, pruned and forgotten, with refused and failed operations interleaved. Catches a
+// commit that moves a job without reporting it, a removal reported as anything but Forgotten
+// (or not at all) by Prune or Forget, a Failed or Cancelled job dropped from Pending before it
+// is Delivered or Forgotten, a change reported by a refused or failed operation, and an
+// Opened snapshot that is not the Pending query. The wrong foldings must each diverge from
+// Pending at least once, so the scenario cannot pass without reaching every removal path.
+#[test]
+fn the_ruled_fold_of_opened_and_committed_changes_equals_pending_through_the_lifecycle() {
+    let directory = TempDir::new().unwrap();
+    let memory = create(&directory, Sequence::AsReady);
+    start(&memory, "early", 1);
+    stop(&memory, "early");
+    import(&memory, "old", 1, "old text");
+    let mut subscriber = Subscriber::open(&memory);
+    assert_eq!(
+        *subscriber.ruled(),
+        JobView::from([("early".to_string(), State::Transcribing)])
+    );
+
+    subscriber.follow(&memory, turn(), 2, Some("a"));
+    assert_eq!(
+        subscriber.refuse(&memory, Input::Requeue(JobId("a".into())), 2),
+        Output::Requeueing(Requeueing::InProgress(JobState {
+            job_id: JobId("a".into()),
+            state: State::Recording,
+        }))
+    );
+    subscriber.refuse(&memory, Input::Interrupt(JobId("missing".into())), 2);
+    subscriber.fail(&memory, hearing("a", "too early"), 2, None);
+    subscriber.fail(&memory, finishing("a"), 2, None);
+    subscriber.follow(&memory, turn(), 3, None);
+    let heard = subscriber.follow(&memory, hearing("a", "one"), 3, None);
+    assert_eq!(
+        heard.output,
+        Output::Next(Next::Deliverable(ready("a", "one", Delivery::Kept)))
+    );
+    assert_eq!(subscriber.ruled().get("a"), Some(&State::Waiting));
+    subscriber.fail(&memory, turn(), 3, Some("a"));
+    subscriber.fail(&memory, turn(), 3, None);
+    subscriber.fail(&memory, hearing("a", "twice"), 3, None);
+    subscriber.follow(&memory, finishing("a"), 4, None);
+    assert!(!subscriber.ruled().contains_key("a"));
+
+    let failed = subscriber.follow(
         &memory,
         Input::Record(Record_Data {
-            job_id: JobId("failed".into()),
+            job_id: JobId("early".into()),
             hearing: Hearing::Exhausted(Vec::new()),
         }),
-        2,
-        None,
-    );
-    view.follow(&memory, turn(), 3, Some("cancelled"));
-    view.follow(&memory, Input::Drop, 3, None);
-    view.follow(&memory, turn(), 4, Some("waiting"));
-    view.follow(&memory, turn(), 4, None);
-    view.follow(&memory, turn(), 5, Some("recording"));
-    view.follow(&memory, hearing("waiting", "ready"), 5, None);
-    view.follow(
-        &memory,
-        Input::Interrupt(JobId("recording".into())),
         5,
         None,
     );
-    view.follow(
+    assert_eq!(failed.changes, changes(&[("early", State::Failed)], &[]));
+    subscriber.follow(&memory, turn(), 6, Some("c"));
+    subscriber.follow(&memory, Input::Drop, 6, None);
+    subscriber.follow(&memory, turn(), 7, Some("i"));
+    subscriber.follow(&memory, Input::Interrupt(JobId("i".into())), 7, None);
+    subscriber.refuse(&memory, Input::Drop, 7);
+    assert_eq!(subscriber.ruled().get("early"), Some(&State::Failed));
+    assert_eq!(subscriber.ruled().get("c"), Some(&State::Cancelled));
+    assert_eq!(subscriber.ruled().get("i"), Some(&State::Transcribing));
+
+    // A delivered job requeued and exhausted keeps its earlier text: Failed, with text.
+    capture(&memory, "f2", 8, "first text");
+    subscriber.agree(&memory, "capture f2");
+    subscriber.follow(&memory, Input::Requeue(JobId("f2".into())), 9, None);
+    subscriber.follow(
         &memory,
-        Input::Apply(Set::AudioKept(Retention::Days(Days(0)))),
-        6,
+        Input::Record(Record_Data {
+            job_id: JobId("f2".into()),
+            hearing: Hearing::Exhausted(Vec::new()),
+        }),
+        9,
         None,
     );
-    view.follow(&memory, Input::Prune, 10, None);
-    view.follow(
+    assert_eq!(subscriber.ruled().get("f2"), Some(&State::Failed));
+
+    // The Failed job stays in Pending until it is Delivered.
+    subscriber.follow(&memory, Input::Requeue(JobId("early".into())), 10, None);
+    subscriber.follow(&memory, hearing("early", "late"), 10, None);
+    subscriber.follow(&memory, hearing("i", "interrupted"), 10, None);
+    assert_eq!(subscriber.ruled().get("early"), Some(&State::Waiting));
+    subscriber.follow(&memory, finishing("early"), 11, None);
+    subscriber.follow(&memory, finishing("i"), 11, None);
+    assert!(!subscriber.ruled().contains_key("early"));
+
+    // Forget erases f2's audio; its text keeps it retained, Failed, in Pending.
+    subscriber.follow(
         &memory,
-        Input::Forget(vec![location("/fixture/audio-before", "cancelled")]),
-        10,
+        Input::Forget(vec![location("/fixture/audio-before", "f2")]),
+        12,
         None,
     );
-    assert!(!view.jobs.contains_key("cancelled"));
-    view.follow(&memory, Input::Requeue(JobId("delivered".into())), 11, None);
-    view.follow(&memory, turn(), 12, Some("restarted"));
+    assert_eq!(subscriber.ruled().get("f2"), Some(&State::Failed));
+    subscriber.follow(
+        &memory,
+        Input::Apply(Set::TextKept(Retention::Days(Days(0)))),
+        12,
+        None,
+    );
+    let pruned = subscriber.follow(&memory, Input::Prune, 13, None);
+    assert_eq!(
+        forgotten_ids(&pruned),
+        ["f2", "old"].map(String::from).into()
+    );
+    let record = memory.inspect().unwrap();
+    for id in ["f2", "old"] {
+        assert!(record.job_vector.iter().all(|job| job.job_id.0 != id));
+    }
+    assert_eq!(subscriber.ruled().get("c"), Some(&State::Cancelled));
+
+    let forgotten = subscriber.follow(
+        &memory,
+        Input::Forget(vec![location("/fixture/audio-before", "c")]),
+        14,
+        None,
+    );
+    assert_eq!(forgotten.changes, changes(&[], &["c"]));
+    assert!(!subscriber.ruled().contains_key("c"));
+    assert!(
+        memory
+            .inspect()
+            .unwrap()
+            .job_vector
+            .iter()
+            .all(|job| job.job_id.0 != "c")
+    );
+    subscriber.refuse(
+        &memory,
+        Input::Forget(vec![location("/fixture/audio-before", "c")]),
+        14,
+    );
+
+    subscriber.follow(&memory, turn(), 15, Some("restarted"));
     drop(memory);
     let memory = reopen(&directory);
-    view.follow(&memory, Input::Recover, 13, None);
-    assert_eq!(view.jobs.get("restarted"), Some(&State::Transcribing));
+    subscriber.agree(&memory, "reopen");
+    subscriber.follow(&memory, Input::Recover, 16, None);
+    assert_eq!(
+        subscriber.ruled().get("restarted"),
+        Some(&State::Transcribing)
+    );
+    for (folding, _, diverged) in &subscriber.views {
+        assert!(
+            *folding == Folding::Ruled || *diverged,
+            "{folding:?} never diverged from Pending"
+        );
+    }
 }
 
 // RC13 coverage: AudioLocation Datom identity. Catches a Datom spelling that carries a second
@@ -2772,7 +2963,7 @@ fn ordinary_and_meta_refusals_share_unknown_backend_and_dispatch_through_answeri
         }
         fn subscribe(
             &self,
-        ) -> Result<signal::Stream<Vec<JobState>, JobState>, signal_listener::Output> {
+        ) -> Result<signal::Stream<Vec<JobState>, JobChange>, signal_listener::Output> {
             Err(signal_listener::Output::Refused(Refused_Data::Unwritable))
         }
     }
@@ -3010,4 +3201,580 @@ fn pending_lists_every_retained_job_but_delivered_ones_across_transitions_and_re
         None,
     );
     expect(&memory, &[("recording", Transcribing)]);
+}
+
+fn every_state() -> [State; 6] {
+    [
+        State::Recording,
+        State::Transcribing,
+        State::Waiting,
+        State::Delivered,
+        State::Failed,
+        State::Cancelled,
+    ]
+}
+// Both JobChange variants: a JobState for every State, and Forgotten.
+fn every_job_change() -> Vec<JobChange> {
+    every_state()
+        .into_iter()
+        .map(|state| {
+            JobChange::JobState(JobState {
+                job_id: JobId("job".into()),
+                state,
+            })
+        })
+        .chain([JobChange::Forgotten(JobId("job".into()))])
+        .collect()
+}
+fn every_subscribed_frame() -> Vec<signal::Frame<Vec<JobState>, JobChange>> {
+    use signal::Frame;
+    let jobs: Vec<JobState> = every_state()
+        .into_iter()
+        .enumerate()
+        .map(|(index, state)| JobState {
+            job_id: JobId(format!("job-{index}")),
+            state,
+        })
+        .collect();
+    [
+        Frame::Opened(jobs.clone()),
+        Frame::Opened(Vec::new()),
+        Frame::Lagged(jobs),
+    ]
+    .into_iter()
+    .chain(every_job_change().into_iter().map(Frame::Changed))
+    .collect()
+}
+
+// The ordinary JobChange and the Subscribed frame through the Signal archive. Catches a
+// JobChange whose variants are confused or lose their payload (Forgotten read back as a
+// JobState, a JobState's State swapped), an Opened, Lagged or Changed frame that does not
+// survive the archive or comes back as another frame, and a reader that accepts a variant tag
+// outside JobChange's two, a truncated archive, or an archive followed by further bytes.
+#[test]
+fn job_change_and_subscribed_frames_survive_the_signal_archive_and_corrupt_bytes_are_refused() {
+    use signal::{ByteViewable, Restorable, Signal, Signalizable};
+    let changes = every_job_change();
+    for change in &changes {
+        let bytes = change.signalize().unwrap().bytes().to_vec();
+        assert_eq!(
+            Signal::<JobChange>::from(bytes.clone()).restore().unwrap(),
+            *change
+        );
+        // The archive's root is its last bytes, and an enum's tag is the root's first byte.
+        let tag = bytes.len() - std::mem::size_of::<rkyv::Archived<JobChange>>();
+        assert!(bytes[tag] < 2, "{bytes:?}");
+        for wrong in 2..=u8::MAX {
+            let mut corrupt = bytes.clone();
+            corrupt[tag] = wrong;
+            assert!(
+                Signal::<JobChange>::from(corrupt).restore().is_err(),
+                "tag {wrong} accepted"
+            );
+        }
+        assert!(
+            Signal::<JobChange>::from(bytes[..bytes.len() - 1].to_vec())
+                .restore()
+                .is_err()
+        );
+        for trailing in 0..=u8::MAX {
+            let mut longer = bytes.clone();
+            longer.push(trailing);
+            assert!(
+                Signal::<JobChange>::from(longer).restore().is_err(),
+                "a trailing {trailing} accepted"
+            );
+        }
+    }
+    for frame in every_subscribed_frame() {
+        let output = signal_listener::Output::Subscribed(frame);
+        let bytes = output.signalize().unwrap().bytes().to_vec();
+        assert_eq!(
+            Signal::<signal_listener::Output>::from(bytes)
+                .restore()
+                .unwrap(),
+            output
+        );
+    }
+}
+
+// The ruled Datom spelling of JobChange and of the Subscribed frames, and their Datom
+// round-trip. Catches a renamed variant (the State or Retired forms Fable ruled out), a
+// JobState variant that does not carry the JobState struct, a Forgotten that carries more
+// than its JobId, the pre-retirement Subscribed change that was a bare JobState, and a reader
+// that accepts trailing text.
+#[cfg(feature = "datom")]
+#[test]
+fn datom_spells_job_change_and_subscribed_frames_by_the_ruled_names() {
+    use datom_codec::{Composing, Datomizable};
+    use signal::Frame;
+    let budget = || datom_codec::Budget {
+        remaining: 1024,
+        reader: 4096_usize.try_into().unwrap(),
+        depth: 0,
+        maximum_depth: 64,
+    };
+    for (state, spelled) in every_state().into_iter().zip([
+        "Recording",
+        "Transcribing",
+        "Waiting",
+        "Delivered",
+        "Failed",
+        "Cancelled",
+    ]) {
+        let change = JobChange::JobState(JobState {
+            job_id: JobId("job".into()),
+            state,
+        });
+        assert_eq!(
+            decode::<JobChange>(&format!("JobState.{{ job {spelled} }}")).unwrap(),
+            change
+        );
+        assert_eq!(
+            decode::<signal_listener::Output>(&format!(
+                "Subscribed.Changed.JobState.{{ job {spelled} }}"
+            ))
+            .unwrap(),
+            signal_listener::Output::Subscribed(Frame::Changed(change))
+        );
+    }
+    assert_eq!(
+        decode::<JobChange>("Forgotten.job").unwrap(),
+        JobChange::Forgotten(JobId("job".into()))
+    );
+    assert_eq!(
+        decode::<signal_listener::Output>("Subscribed.Changed.Forgotten.job").unwrap(),
+        signal_listener::Output::Subscribed(Frame::Changed(JobChange::Forgotten(JobId(
+            "job".into()
+        ))))
+    );
+    assert_eq!(
+        decode::<signal_listener::Output>(
+            "Subscribed.Opened.[ { first Waiting } { second Failed } ]"
+        )
+        .unwrap(),
+        signal_listener::Output::Subscribed(Frame::Opened(vec![
+            JobState {
+                job_id: JobId("first".into()),
+                state: State::Waiting,
+            },
+            JobState {
+                job_id: JobId("second".into()),
+                state: State::Failed,
+            },
+        ]))
+    );
+    for change in every_job_change() {
+        let datom = change.datomize(Vec::new());
+        assert_eq!(JobChange::compose(&datom, &mut budget()).unwrap(), change);
+    }
+    for frame in every_subscribed_frame() {
+        let output = signal_listener::Output::Subscribed(frame);
+        let datom = output.datomize(Vec::new());
+        assert_eq!(
+            signal_listener::Output::compose(&datom, &mut budget()).unwrap(),
+            output
+        );
+    }
+    for wrong in [
+        "State.{ job Waiting }",
+        "Retired.job",
+        "JobState.job",
+        "JobState.{ job Waiting Failed }",
+        "Forgotten.{ job Waiting }",
+        "Forgotten.job job",
+        "JobState.{ job Waiting } extra",
+    ] {
+        assert!(decode::<JobChange>(wrong).is_err(), "{wrong}");
+    }
+    for wrong in [
+        "Subscribed.Changed.{ job Waiting }",
+        "Subscribed.Changed.Retired.job",
+        "Subscribed.Changed.Forgotten.job extra",
+        "Subscribed.Opened.[ Forgotten.job ]",
+    ] {
+        assert!(decode::<signal_listener::Output>(wrong).is_err(), "{wrong}");
+    }
+}
+
+// The InProgress invariant: Requeue refuses every job that is Recording, Transcribing or
+// Waiting with InProgress carrying its current JobState, however the job reached that state,
+// and requeues every terminal job with kept audio. Catches a Requeue that resets an in-progress
+// job reached by a route other than the plain one (Interrupt, Recover after reopen, an earlier
+// Requeue, a Waiting job held behind an earlier one under AsRecorded), an InProgress carrying
+// a stale state, a refusal that commits a change, and a terminal state refused. Requeue of a
+// Cancelled job is accepted on the reading that InProgress is ruled for Recording, Transcribing
+// and Waiting alone (the producer seams), with vision/listener/1.md's "Retranscribe hears a
+// job's kept audio anew"; no ruling names Cancelled itself.
+#[test]
+fn requeue_refuses_every_in_progress_state_however_reached_and_requeues_every_terminal_state() {
+    fn in_progress(memory: &listener_memory::Memory, id: &str, state: State) {
+        assert_eq!(
+            observe(memory, Input::Requeue(JobId(id.into())), 20),
+            Output::Requeueing(Requeueing::InProgress(JobState {
+                job_id: JobId(id.into()),
+                state,
+            })),
+            "{id}"
+        );
+    }
+    let directory = TempDir::new().unwrap();
+    let memory = create(&directory, Sequence::AsRecorded);
+    capture(&memory, "delivered", 1, "spoken");
+    start(&memory, "failed", 2);
+    stop(&memory, "failed");
+    exhaust(&memory, "failed", Vec::new());
+    start(&memory, "cancelled", 3);
+    execute(&memory, Input::Drop, 3, None);
+    start(&memory, "stopped", 4);
+    stop(&memory, "stopped");
+    start(&memory, "interrupted", 5);
+    execute(
+        &memory,
+        Input::Interrupt(JobId("interrupted".into())),
+        5,
+        None,
+    );
+    start(&memory, "held", 6);
+    stop(&memory, "held");
+    assert_eq!(heard(&memory, "held", "held text"), Next::Nothing);
+    start(&memory, "recording", 7);
+    in_progress(&memory, "recording", State::Recording);
+    in_progress(&memory, "stopped", State::Transcribing);
+    in_progress(&memory, "interrupted", State::Transcribing);
+    in_progress(&memory, "held", State::Waiting);
+    for id in ["delivered", "failed", "cancelled"] {
+        assert_eq!(
+            changed(
+                &memory,
+                Input::Requeue(JobId(id.into())),
+                8,
+                None,
+                changes(&[(id, State::Transcribing)], &[]),
+            ),
+            Output::Requeueing(Requeueing::Requeued(JobId(id.into())))
+        );
+        in_progress(&memory, id, State::Transcribing);
+    }
+    assert_eq!(
+        standing(&memory).get("cancelled"),
+        Some(&State::Transcribing)
+    );
+    drop(memory);
+    let memory = reopen(&directory);
+    execute(&memory, Input::Recover, 9, None);
+    in_progress(&memory, "recording", State::Transcribing);
+    assert_eq!(
+        observe(&memory, Input::Tries(JobId("cancelled".into())), 9),
+        trial(vec![backend("speech", "model")])
+    );
+    assert_eq!(heard(&memory, "cancelled", "heard anew"), Next::Nothing);
+    in_progress(&memory, "cancelled", State::Waiting);
+}
+
+// UNRULED: duplicate names in Order. No ruling or contract text says whether an Order may
+// name a backend twice; the producer accepts it on create and on Set::Order and keeps it as
+// written. This pins that current behavior so a change to it is seen; it is not a ruled
+// oracle. It catches an Order silently deduplicated or reordered on create, Set or reopen.
+#[test]
+fn duplicate_order_names_are_kept_as_written_on_create_set_and_reopen_unruled() {
+    let directory = TempDir::new().unwrap();
+    let written = ["speech", "whisper", "speech"];
+    let memory = definition(&directory)
+        .create(configured(
+            Sequence::AsReady,
+            &["speech", "whisper"],
+            &written,
+        ))
+        .unwrap();
+    assert_eq!(
+        settings(&memory).order,
+        Order(written.iter().map(|text| name(text)).collect())
+    );
+    let twice = vec![name("whisper"), name("whisper")];
+    apply(&memory, Set::Order(twice.clone()));
+    drop(memory);
+    let memory = reopen(&directory);
+    assert_eq!(settings(&memory).order, Order(twice.clone()));
+    start(&memory, "job", 1);
+    assert_eq!(
+        job(&memory.inspect().unwrap(), "job").backend_name_vector,
+        twice
+    );
+}
+
+// Removing a backend takes its name out of the configured Order and keeps every other name in
+// its order; an Order that leaves a backend out keeps that backend configured. Catches a
+// RemoveBackend that clears, rebuilds or reorders the Order, one that changes an Order which
+// did not name the removed backend, a Set::Order that deletes the backends it leaves out, a
+// later Turn that does not use the remaining Order, and an Order naming the removed backend
+// accepted afterwards.
+#[test]
+fn removing_a_backend_keeps_the_rest_of_the_configured_order_in_its_order() {
+    let directory = TempDir::new().unwrap();
+    let memory = definition(&directory)
+        .create(configured(
+            Sequence::AsReady,
+            &["first", "second", "third", "fourth"],
+            &["fourth", "second", "first"],
+        ))
+        .unwrap();
+    apply(&memory, Set::RemoveBackend(name("second")));
+    let configuration = settings(&memory);
+    assert_eq!(
+        configuration.order,
+        Order(vec![name("fourth"), name("first")])
+    );
+    assert_eq!(
+        configuration.backend_vector,
+        vec![
+            backend("first", "model"),
+            backend("third", "model"),
+            backend("fourth", "model")
+        ]
+    );
+    apply(&memory, Set::RemoveBackend(name("third")));
+    assert_eq!(
+        settings(&memory).order,
+        Order(vec![name("fourth"), name("first")])
+    );
+    assert_eq!(
+        observe(
+            &memory,
+            Input::Apply(Set::Order(vec![name("first"), name("second")])),
+            1
+        ),
+        Output::Applying(Applying::UnknownBackend(UnknownBackend(name("second"))))
+    );
+    apply(&memory, Set::Order(vec![name("first")]));
+    let configuration = settings(&memory);
+    assert_eq!(configuration.order, Order(vec![name("first")]));
+    assert_eq!(
+        configuration.backend_vector,
+        vec![backend("first", "model"), backend("fourth", "model")]
+    );
+    drop(memory);
+    let memory = reopen(&directory);
+    assert_eq!(settings(&memory), configuration);
+    start(&memory, "job", 2);
+    assert_eq!(
+        job(&memory.inspect().unwrap(), "job").backend_name_vector,
+        vec![name("first")]
+    );
+}
+
+// The failed-commit fixture. A child process opens an existing store under a file-size limit
+// near its size, with SIGXFSZ ignored, and imports a text far larger than the limit, so the
+// kernel's commit fails with EFBIG. The child answers whether execute reported the commit.
+const COMMIT_PATH: &str = "LISTENER_TESTS_COMMIT_PATH";
+const FAILED_COMMIT: i32 = 71;
+#[test]
+#[ignore = "child process of the failed-commit fixture; its parent names the store"]
+fn commit_child() {
+    let path = std::path::PathBuf::from(std::env::var_os(COMMIT_PATH).unwrap());
+    let memory = definition_at(&path).open().unwrap();
+    let result = memory.execute(request(
+        Input::Import(Import_Data {
+            moment: Moment(9),
+            text: Text("x".repeat(16 << 20)),
+        }),
+        9,
+        Some("large"),
+    ));
+    std::process::exit(if result.is_ok() { 0 } else { FAILED_COMMIT });
+}
+
+// A commit the kernel refuses escapes as an error and changes nothing: execute returns no
+// Committed (so no change reaches a subscriber) and the store reopens exactly as it was, still
+// committing. Catches an execute that ignores the kernel's write result and reports the
+// changes anyway, and a failed commit that leaves the store damaged or partly written.
+#[test]
+fn a_commit_the_kernel_refuses_reports_nothing_and_leaves_the_store_as_it_was() {
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join("state.memory");
+    let memory = definition_at(&path)
+        .create(configuration(Sequence::AsReady))
+        .unwrap();
+    capture(&memory, "kept", 1, "kept text");
+    start(&memory, "active", 2);
+    let state = memory.inspect().unwrap();
+    drop(memory);
+    let blocks = std::fs::metadata(&path).unwrap().len() / 512 + 16;
+    let status = std::process::Command::new("/bin/sh")
+        .args([
+            "-c",
+            "ulimit -c 0; trap '' XFSZ; ulimit -f \"$1\" && exec \"$2\" --ignored --exact commit_child --test-threads 1",
+            "sh",
+        ])
+        .arg(blocks.to_string())
+        .arg(std::env::current_exe().unwrap())
+        .env(COMMIT_PATH, &path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap();
+    assert_eq!(status.code(), Some(FAILED_COMMIT), "{status}");
+    let memory = definition_at(&path).open().unwrap();
+    assert_eq!(memory.inspect().unwrap(), state);
+    assert_eq!(
+        standing(&memory),
+        JobView::from([("active".to_string(), State::Recording)])
+    );
+    import(&memory, "after", 3, "after text");
+}
+
+// The publication crash fixture: the creation child runs under strace, which kills it with
+// SIGKILL on entry to the chosen invocation of one system call, so the call never runs. The
+// sweep kills at every linkat (publication is a hard link), every fsync (the staged file's
+// sync, then the parent directory's after the link) and every fdatasync (the kernel's
+// commits), until a run completes.
+#[derive(Debug)]
+struct InjectedRun {
+    syscall: &'static str,
+    invocation: u32,
+    ending: Ending,
+    final_path: FinalPath,
+    staged: Vec<Stage>,
+    parent: TempDir,
+}
+fn injected_runs(creator: &str, syscall: &'static str) -> Vec<InjectedRun> {
+    use std::os::unix::process::ExitStatusExt;
+    let executable = std::env::current_exe().unwrap();
+    let mut runs = Vec::new();
+    for invocation in 1..=64 {
+        let parent = TempDir::new().unwrap();
+        let path = parent.path().join("state.memory");
+        let status = std::process::Command::new("strace")
+            .args(["-f", "-qq", "-o", "/dev/null"])
+            .arg(format!("--trace={syscall}"))
+            .arg(format!("--inject={syscall}:signal=KILL:when={invocation}"))
+            .arg(&executable)
+            .args([
+                "--ignored",
+                "--exact",
+                "creation_child",
+                "--test-threads",
+                "1",
+            ])
+            .env(CREATION_PATH, &path)
+            .env(CREATOR, creator)
+            .current_dir(parent.path())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        let ending = match (status.code(), status.signal()) {
+            (Some(0), _) => Ending::Completed,
+            (None, Some(9)) | (Some(137), _) => Ending::Killed,
+            _ => panic!(
+                "creation child under strace ended otherwise at {syscall} {invocation}: {status}"
+            ),
+        };
+        let staged = std::fs::read_dir(parent.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path().join("state.memory"))
+            .filter(|staged| staged.is_file())
+            .map(|staged| stage(&staged))
+            .collect();
+        let completed = ending == Ending::Completed;
+        let final_path = final_path(&path);
+        // The sweep's own record, shown by the check that runs it with --nocapture.
+        eprintln!(
+            "{creator} {syscall} {invocation}: {ending:?}, final {final_path:?}, staged {staged:?}"
+        );
+        runs.push(InjectedRun {
+            syscall,
+            invocation,
+            ending,
+            final_path,
+            staged,
+            parent,
+        });
+        if completed {
+            return runs;
+        }
+    }
+    panic!("no creation completed under {syscall} injection: {runs:?}")
+}
+
+// RC1, the window a file-size limit cannot reach: a process killed after the record commits
+// and before publication, or after publication and before the directory sync (the executor's
+// own seam for it, store.rs's exit_after_initial_commit, is a private unit test and is not
+// reachable from here; strace kills the real create at the system call instead). Every killed
+// creation leaves the final path absent (open answers MissingStore and a retry creates a
+// complete store) or complete (it opens with the created configuration and commits); never
+// stamped-only, empty or damaged. The sweep must show both windows: a kill at linkat with the
+// staged file Recorded and the final path absent, and a kill after the link with the final path
+// complete. Catches a creation that links or renames before the record commits, one that
+// publishes an incomplete file, and one whose interrupted staging blocks a later creation.
+// Needs strace, so it is ignored here and run by the flake's publication-crash check.
+#[test]
+#[ignore = "needs strace; run by checks.publication-crash"]
+fn a_crash_after_the_record_commits_and_before_publication_leaves_the_final_path_absent_or_complete()
+ {
+    let runs: Vec<InjectedRun> = ["linkat", "fsync", "fdatasync"]
+        .into_iter()
+        .flat_map(|syscall| injected_runs("producer", syscall))
+        .collect();
+    assert!(
+        runs.iter().any(|run| run.syscall == "linkat"
+            && run.ending == Ending::Killed
+            && run.final_path == FinalPath::Absent
+            && run.staged == [Stage::Recorded]),
+        "no kill between the record's commit and publication: {runs:?}"
+    );
+    assert!(
+        runs.iter()
+            .any(|run| run.ending == Ending::Killed && run.final_path == FinalPath::Complete),
+        "no kill after publication: {runs:?}"
+    );
+    for run in &runs {
+        let path = run.parent.path().join("state.memory");
+        match run.final_path {
+            FinalPath::Absent => {
+                assert_ne!(
+                    run.ending,
+                    Ending::Completed,
+                    "{} {} completed without publishing",
+                    run.syscall,
+                    run.invocation
+                );
+                assert!(
+                    matches!(definition_at(&path).open(), Err(Error::MissingStore)),
+                    "{run:?}"
+                );
+                let retried = definition_at(&path)
+                    .create(configuration(Sequence::AsRecorded))
+                    .unwrap();
+                start(&retried, "after", 1);
+                let state = retried.inspect().unwrap();
+                drop(retried);
+                assert_eq!(
+                    definition_at(&path).open().unwrap().inspect().unwrap(),
+                    state
+                );
+            }
+            FinalPath::Complete => {
+                let memory = definition_at(&path).open().unwrap();
+                import(&memory, "after", 1, "after text");
+                let state = memory.inspect().unwrap();
+                drop(memory);
+                assert_eq!(
+                    definition_at(&path).open().unwrap().inspect().unwrap(),
+                    state
+                );
+            }
+            FinalPath::Incomplete(_) => panic!("an incomplete final path: {run:?}"),
+        }
+    }
+    // The fixture's own discrimination: the deliberately wrong direct creator, killed at its
+    // kernel commits, leaves an incomplete final path, so the sweep reaches a window that
+    // matters and the assertions above cannot pass vacuously.
+    assert!(
+        injected_runs("direct", "fdatasync")
+            .iter()
+            .any(|run| run.ending == Ending::Killed
+                && matches!(run.final_path, FinalPath::Incomplete(_))),
+        "the sweep never caught the direct creator"
+    );
 }
