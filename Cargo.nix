@@ -827,8 +827,8 @@ rec {
         workspace_member = null;
         src = pkgs.fetchgit {
           url = "https://github.com/LiGoldragon/listener-library";
-          rev = "d0f571a18e0aa5fb8ecd6454fc5bf813a52edf96";
-          sha256 = "194n6gv4r9n5100v5l1jnifdm709r36bdaawdqk9hbifij8j2jrd";
+          rev = "5dbc60f59084a388bb0348d528b3da92bf53aedd";
+          sha256 = "164957bhyafzrjnz851f26ms5hxv7bgqqvvz55hzfvxwqdj51m7f";
         };
         libName = "listener_library";
         dependencies = [
@@ -900,8 +900,8 @@ rec {
         workspace_member = null;
         src = pkgs.fetchgit {
           url = "https://github.com/LiGoldragon/listener";
-          rev = "c0a10f5169e9084aef422cf1bf85510e0d510e3d";
-          sha256 = "04c0lbpv8v1p13x6ca9asqvi3s32dwv8d8zs14smk781cafisprd";
+          rev = "aa812883f7f14693abd32072cbd378f15292dc26";
+          sha256 = "1ds349iv2z80q1mb3vj5szjx5apqn14ibbsdy879bm3r9mhhd7iy";
         };
         libName = "listener_memory";
         dependencies = [
@@ -1102,8 +1102,8 @@ rec {
         workspace_member = null;
         src = pkgs.fetchgit {
           url = "https://github.com/LiGoldragon/meta-signal-listener";
-          rev = "0cf47f03e4c99ab424f5db6171875dd9f929161a";
-          sha256 = "1k2qkbl467x7w89jc4dhlkvfx16y73qhsbxx08zdrww4wixnshzk";
+          rev = "e9d2730eb0aef21371a53516a8dca88a9988853c";
+          sha256 = "0rf46w5s6hxdrcm560v196197hyvrx27140mpw9mr7qrd1zjhba6";
         };
         libName = "meta_signal_listener";
         dependencies = [
@@ -1897,8 +1897,8 @@ rec {
         workspace_member = null;
         src = pkgs.fetchgit {
           url = "https://github.com/LiGoldragon/signal-listener";
-          rev = "df64d2d6e4ca497980a750c4a9229354c126c330";
-          sha256 = "0k021g4h13js03cwqm4dhgwsn45v0054wd9v820rm6i39kyyhpn6";
+          rev = "5052fd8f5d3c1609431dc75d6f85306a1c3a5e18";
+          sha256 = "1isr9k1z5npw7g3wxlbb3lmmyhwdb8cvfif8jj6drzmkl57n0w61";
         };
         libName = "signal_listener";
         dependencies = [
@@ -2401,8 +2401,8 @@ rec {
         workspace_member = null;
         src = pkgs.fetchgit {
           url = "https://github.com/LiGoldragon/translator";
-          rev = "77ecf05ff43d2063cf4336287dd4bf281ca2e69f";
-          sha256 = "06agdjjw83cknfpw9vd7n4xbv0zk38jhk25ssag77lfiqhdmivmv";
+          rev = "cb4f6f4e5b3ef07f41d749e669dda58a6bcbf585";
+          sha256 = "16krsg14s13lqz9yj7h623fgap9zy2x8c58wl6kvr9vpkxzzp6pz";
         };
         dependencies = [
           {
