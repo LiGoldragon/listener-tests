@@ -1,0 +1,4 @@
+#!/bin/sh
+# Desktop sink for the paste program: the text on standard input, receipts in the run's desk
+# directory. The rig sets LISTENER_RIG_DESK and, when it has one, LISTENER_RIG_PYTHON.
+exec "${LISTENER_RIG_PYTHON:-python3}" -I "$(dirname "$0")/../desk_sink.py" paste "$LISTENER_RIG_DESK"

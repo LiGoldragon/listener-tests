@@ -658,6 +658,10 @@ fn one_recording_stale_interrupt_and_refused_operations_leave_consistent_state()
     );
 }
 
+// Recover settles the delivery claim outstanding at the kill as Kept: its handoff may already
+// have reached the desktop, so Memory never offers it again, and its text stays recallable.
+// The recording job is normalized to Transcribing; the claimed job is the one change of
+// state beyond that, and nothing else is offered.
 #[test]
 fn restart_returns_only_the_accepted_work_plan_and_normalizes_recording() {
     let directory = TempDir::new().unwrap();
@@ -678,14 +682,25 @@ fn restart_returns_only_the_accepted_work_plan_and_normalizes_recording() {
         recovery.hear.0,
         vec![JobId("transcribing".into()), JobId("recording".into())]
     );
-    assert_eq!(ready_id(recovery.next), "waiting");
-    assert_eq!(
-        reopened.inspect().unwrap().job_vector[2].state,
-        State::Transcribing
-    );
+    assert_eq!(recovery.next, Next::Nothing);
+    let record = reopened.inspect().unwrap();
+    assert_eq!(record.delivery_claim.0, None);
+    assert_eq!(record.job_vector[1].state, State::Delivered);
+    assert_eq!(record.job_vector[1].handing_option, Some(Handing::Kept));
+    assert_eq!(record.job_vector[2].state, State::Transcribing);
     assert_eq!(
         result.changes,
-        changes(&[("recording", State::Transcribing)], &[])
+        changes(
+            &[
+                ("waiting", State::Delivered),
+                ("recording", State::Transcribing),
+            ],
+            &[]
+        )
+    );
+    assert_eq!(
+        observe(&reopened, Input::Find(JobId("waiting".into())), 4),
+        Output::Finding(Finding::Ready(ready("waiting", "ready", Delivery::Kept)))
     );
 }
 
@@ -2374,15 +2389,13 @@ fn open_of_a_missing_path_makes_nothing_and_a_refused_create_leaves_nothing() {
 // own store and reopened without a configuration; Recover then answers by the stored policy.
 // Catches an open that substitutes a default configuration of either policy (one of the two
 // stores then answers the other's way) and a create whose configuration is not the one that
-// persists.
+// persists. Under AsReady the claim "second" held at the kill is settled Kept, not replayed;
+// under AsRecorded no claim existed, and "second" waits behind the Transcribing "first".
 #[test]
 fn reopen_recovers_under_the_persisted_policy_of_each_separately_created_store() {
-    for (sequence, next) in [
-        (
-            Sequence::AsReady,
-            Next::Deliverable(ready("second", "two", Delivery::Kept)),
-        ),
-        (Sequence::AsRecorded, Next::Nothing),
+    for (sequence, second) in [
+        (Sequence::AsReady, State::Delivered),
+        (Sequence::AsRecorded, State::Waiting),
     ] {
         let directory = TempDir::new().unwrap();
         let memory = create(&directory, sequence.clone());
@@ -2394,14 +2407,214 @@ fn reopen_recovers_under_the_persisted_policy_of_each_separately_created_store()
         drop(memory);
         let memory = reopen(&directory);
         assert_eq!(settings(&memory).sequence, sequence);
+        let result = execute(&memory, Input::Recover, 3, None);
         assert_eq!(
-            execute(&memory, Input::Recover, 3, None).output,
+            result.output,
             Output::Recovered(Recovery {
                 hear: Hear(vec![JobId("first".into())]),
-                next,
+                next: Next::Nothing,
             })
         );
+        let record = memory.inspect().unwrap();
+        assert_eq!(record.delivery_claim.0, None);
+        assert_eq!(job(&record, "second").state, second);
+        let settled: Vec<(&str, State)> = if second == State::Delivered {
+            vec![("second", State::Delivered)]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(result.changes, changes(&settled, &[]));
     }
+}
+
+// An outstanding claim is settled on every open, not only the first: a store reopened and
+// recovered again, or probed by an explicit advance, offers the settled job nothing further.
+// Catches a Recover that re-arms the claim it settled, an Advance that offers it, and a
+// Recover on a settled store that reports a change.
+#[test]
+fn an_outstanding_claim_is_settled_kept_and_never_replayed_across_repeated_restarts() {
+    let directory = TempDir::new().unwrap();
+    let memory = create(&directory, Sequence::AsReady);
+    start(&memory, "claimed", 1);
+    stop(&memory, "claimed");
+    assert_eq!(ready_id(heard(&memory, "claimed", "one")), "claimed");
+    drop(memory);
+    let memory = reopen(&directory);
+    assert_eq!(
+        changed(
+            &memory,
+            Input::Recover,
+            2,
+            None,
+            changes(&[("claimed", State::Delivered)], &[]),
+        ),
+        Output::Recovered(Recovery {
+            hear: Hear(Vec::new()),
+            next: Next::Nothing,
+        })
+    );
+    assert_eq!(
+        job(&memory.inspect().unwrap(), "claimed").handing_option,
+        Some(Handing::Kept)
+    );
+    drop(memory);
+    for moment in 3..6 {
+        let memory = reopen(&directory);
+        assert_eq!(
+            changed(&memory, Input::Recover, moment, None, changes(&[], &[])),
+            Output::Recovered(Recovery {
+                hear: Hear(Vec::new()),
+                next: Next::Nothing,
+            })
+        );
+        assert_eq!(
+            observe(&memory, Input::Advance, moment),
+            Output::Next(Next::Nothing)
+        );
+        assert_eq!(memory.inspect().unwrap().delivery_claim.0, None);
+        drop(memory);
+    }
+}
+
+// The Waiting job behind the claim drains once the claim is settled: the first Next after the
+// settlement offers it, exactly once, and finishing it leaves nothing. Catches a settlement that
+// leaves the claim armed (the later job is never offered), an offer made twice, and a later job
+// that is offered while the claim it waits behind is still outstanding.
+#[test]
+fn later_waiting_jobs_drain_once_the_outstanding_claim_is_settled() {
+    let directory = TempDir::new().unwrap();
+    let memory = create(&directory, Sequence::AsReady);
+    start(&memory, "claimed", 1);
+    stop(&memory, "claimed");
+    assert_eq!(ready_id(heard(&memory, "claimed", "one")), "claimed");
+    start(&memory, "later", 2);
+    stop(&memory, "later");
+    assert_eq!(heard(&memory, "later", "two"), Next::Nothing);
+    drop(memory);
+    let memory = reopen(&directory);
+    assert_eq!(
+        changed(
+            &memory,
+            Input::Recover,
+            3,
+            None,
+            changes(&[("claimed", State::Delivered)], &[]),
+        ),
+        Output::Recovered(Recovery {
+            hear: Hear(Vec::new()),
+            next: Next::Deliverable(ready("later", "two", Delivery::Kept)),
+        })
+    );
+    assert_eq!(finish(&memory, "later"), Next::Nothing);
+    assert_eq!(
+        observe(&memory, Input::Advance, 4),
+        Output::Next(Next::Nothing)
+    );
+}
+
+// An explicit Recall or RecallJob is answered once with the settled text and records nothing:
+// Memory's Last and Find are reads, so the Nexus performs one handoff per request, and no claim
+// is armed, so no handoff follows on its own. Catches a read that arms a claim, a Find or Last
+// that answers with nothing for a settled job, and an answer that changes the store.
+#[test]
+fn explicit_recall_answers_the_settled_text_once_and_starts_no_automatic_handoff() {
+    let directory = TempDir::new().unwrap();
+    let memory = create(&directory, Sequence::AsReady);
+    start(&memory, "claimed", 1);
+    stop(&memory, "claimed");
+    assert_eq!(ready_id(heard(&memory, "claimed", "one")), "claimed");
+    drop(memory);
+    let memory = reopen(&directory);
+    execute(&memory, Input::Recover, 2, None);
+    assert_eq!(
+        observe(&memory, Input::Last, 3),
+        Output::Lasting(Lasting::Ready(ready("claimed", "one", Delivery::Kept)))
+    );
+    assert_eq!(
+        observe(&memory, Input::Find(JobId("claimed".into())), 3),
+        Output::Finding(Finding::Ready(ready("claimed", "one", Delivery::Kept)))
+    );
+    assert_eq!(
+        observe(&memory, Input::Advance, 3),
+        Output::Next(Next::Nothing)
+    );
+    assert_eq!(memory.inspect().unwrap().delivery_claim.0, None);
+    assert_eq!(
+        job(&memory.inspect().unwrap(), "claimed").state,
+        State::Delivered
+    );
+}
+
+// The claim invariant behind Recover's settlement: while a claim is outstanding, every input the
+// Nexus can send leaves the claimed job Waiting and the claim in place, so the Kept settlement
+// cannot find its job in another state. Each refusal is a refusal, not a change. Catches an
+// input that moves the claimed job or clears the claim, and a Recover that would fail on a claim
+// the public inputs can build.
+#[test]
+fn a_claimed_job_stays_waiting_until_it_is_finished_or_recovered() {
+    let directory = TempDir::new().unwrap();
+    let memory = create(&directory, Sequence::AsReady);
+    start(&memory, "claimed", 1);
+    stop(&memory, "claimed");
+    assert_eq!(ready_id(heard(&memory, "claimed", "one")), "claimed");
+    let holds_claim = |memory: &listener_memory::Memory| {
+        let record = memory.inspect().unwrap();
+        assert_eq!(record.delivery_claim.0, Some(JobId("claimed".into())));
+        assert_eq!(job(&record, "claimed").state, State::Waiting);
+    };
+    holds_claim(&memory);
+    execute(&memory, turn(), 2, Some("fresh"));
+    holds_claim(&memory);
+    execute(&memory, Input::Interrupt(JobId("fresh".into())), 2, None);
+    holds_claim(&memory);
+    execute(&memory, hearing("fresh", "later"), 2, None);
+    holds_claim(&memory);
+    assert!(
+        memory
+            .execute(request(hearing("claimed", "again"), 2, None))
+            .is_err()
+    );
+    holds_claim(&memory);
+    assert!(
+        memory
+            .execute(request(finishing("fresh"), 2, None))
+            .is_err()
+    );
+    holds_claim(&memory);
+    assert!(
+        memory
+            .execute(request(Input::AbortStart(JobId("fresh".into())), 2, None))
+            .is_err()
+    );
+    holds_claim(&memory);
+    for input in [
+        Input::Requeue(JobId("claimed".into())),
+        Input::Requeue(JobId("fresh".into())),
+        Input::Tries(JobId("claimed".into())),
+        Input::Drop,
+        Input::Prune,
+        Input::Forget(Vec::new()),
+        Input::Last,
+        Input::Find(JobId("claimed".into())),
+        Input::Pending,
+        Input::Recollect,
+        Input::Settings,
+        Input::Advance,
+        Input::Apply(Set::AddTerm(term("spelling"))),
+    ] {
+        execute(&memory, input, 3, None);
+        holds_claim(&memory);
+    }
+    import(&memory, "imported", 4, "text");
+    holds_claim(&memory);
+    assert_eq!(
+        execute(&memory, Input::Recover, 5, None).changes,
+        changes(&[("claimed", State::Delivered)], &[])
+    );
+    assert_eq!(
+        memory.inspect().unwrap().delivery_claim.0,
+        Some(JobId("fresh".into()))
+    );
 }
 
 // RC2: removing a selected backend while its job records. Tries keeps the job's selected

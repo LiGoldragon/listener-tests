@@ -1,0 +1,7 @@
+#!/bin/sh
+# Dummy credential program: prints the rig's fixture key for the entry named by its first
+# argument. The key is not a credential; the rig writes it to LISTENER_RIG_KEY_FILE.
+case "$1" in
+  fixture-key) cat "$LISTENER_RIG_KEY_FILE" ;;
+  *) exit 4 ;;
+esac
