@@ -918,19 +918,29 @@ fn meta_configuration_is_a_unit_query_and_its_paired_dispatch_is_generated() {
 #[cfg(feature = "datom")]
 #[test]
 fn datom_queries_and_refusals_keep_the_approved_shapes() {
-    use datom_codec::{Actualizing, Potential};
-    let query: meta_signal_listener::Input = Potential::from("Configuration").actualize().unwrap();
+    use datom_codec::{Actualizing, Budget, Potential};
+    let budget = || Budget {
+        remaining: 128,
+        reader: 128_i64.try_into().unwrap(),
+        depth: 0,
+        maximum_depth: 16,
+    };
+    let query: meta_signal_listener::Input = Potential::from("Configuration")
+        .actualize(&mut budget())
+        .unwrap();
     assert_eq!(query, meta_signal_listener::Input::Configuration);
-    let refusal: meta_signal_listener::Output =
-        Potential::from("Refused.missing").actualize().unwrap();
+    let refusal: meta_signal_listener::Output = Potential::from("Refused.missing")
+        .actualize(&mut budget())
+        .unwrap();
     assert_eq!(
         refusal,
         meta_signal_listener::Output::Refused(meta_signal_listener::UnknownBackend(BackendName(
             "missing".into()
         )))
     );
-    let ordinary: signal_listener::Output =
-        Potential::from("Toggled.Began.job").actualize().unwrap();
+    let ordinary: signal_listener::Output = Potential::from("Toggled.Began.job")
+        .actualize(&mut budget())
+        .unwrap();
     assert_eq!(
         ordinary,
         signal_listener::Output::Toggled(signal_listener::Toggling::Began(JobId("job".into())))
