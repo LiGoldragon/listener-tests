@@ -921,7 +921,7 @@ fn datom_queries_and_refusals_keep_the_approved_shapes() {
     use datom_codec::{Actualizing, Budget, Potential};
     let budget = || Budget {
         remaining: 128,
-        reader: 128_i64.try_into().unwrap(),
+        reader: 128_usize.try_into().unwrap(),
         depth: 0,
         maximum_depth: 16,
     };
